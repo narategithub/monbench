@@ -1,0 +1,17 @@
+{
+  "description": "Default data set: one record per component per sample, like an LDMS metric set. The value rules are defined in core/dataset.py, and every writer must follow them. 'keys' lists the access paths the data set is meant to be queried by; each backend maps them onto its own indexing.",
+  "name": "monitoring",
+  "attributes": [
+    { "name": "timestamp",    "type": "timestamp" },
+    { "name": "component_id", "type": "uint64" },
+    { "name": "job_id",       "type": "uint64" },
+    { "name": "seq",          "type": "uint64" },
+    { "name": "mem_free",     "type": "uint64" },
+    { "name": "load",         "type": "double" }
+  ],
+  "keys": [
+    { "name": "timestamp",     "attrs": ["timestamp"] },
+    { "name": "comp_time",     "attrs": ["component_id", "timestamp"] },
+    { "name": "job_comp_time", "attrs": ["job_id", "component_id", "timestamp"] }
+  ]
+}

@@ -1,0 +1,149 @@
+{
+  "description": "Default query set, used when QUERY_FILE is empty. Each query describes the question once in 'match' (backend-neutral, used for verification) and gives the query string for each backend or dialect in 'query'. Types are named by the conditions the question uses. Copy this file to define your own set; see README.md, 'Query sets'.",
+  "queries": [
+    {
+      "name": "all records",
+      "type": "all",
+      "match": { "order_by": ["timestamp"] },
+      "query": {
+	         "dsos": "select * from {schema} order_by timestamp",
+                 "influxdb": "SELECT * FROM  {schema} ORDER BY timestamp"
+               }
+    },
+    {
+      "name": "all components, 25% of the time span",
+      "type": "time",
+      "match": { "where": "timestamp >= {t_q1} and timestamp < {t_mid}", "order_by": ["timestamp"] },
+      "query": {
+	         "dsos": "select * from {schema} where timestamp >= {t_q1} and timestamp < {t_mid} order_by timestamp",
+                 "influxdb": "SELECT * FROM {schema} WHERE timestamp >= {t_q1} AND timestamp < {t_mid} ORDER BY timestamp"
+               }
+    },
+    {
+      "name": "all components, 1% of the time span",
+      "type": "time",
+      "match": { "where": "timestamp >= {t_mid} and timestamp < {t_mid_1pct}", "order_by": ["timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where timestamp >= {t_mid} and timestamp < {t_mid_1pct} order_by timestamp",
+                 "influxdb": "SELECT * FROM {schema} WHERE timestamp >= {t_mid} AND timestamp < {t_mid_1pct} ORDER BY timestamp"
+               }
+    },
+    {
+      "name": "one component on the first server",
+      "type": "component",
+      "match": { "where": "component_id == {comp_s0}", "order_by": ["component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where component_id == {comp_s0} order_by comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE component_id = {comp_s0} ORDER BY component_id, timestamp"
+               }
+    },
+    {
+      "name": "one component on the last server",
+      "type": "component",
+      "match": { "where": "component_id == {comp_slast}", "order_by": ["component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where component_id == {comp_slast} order_by comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE component_id = {comp_slast} ORDER BY component_id, timestamp"
+               }
+    },
+    {
+      "name": "one component, 25% of the time span",
+      "type": "component+time",
+      "match": { "where": "component_id == {comp_s0} and timestamp >= {t_q1} and timestamp < {t_mid}", "order_by": ["component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where component_id == {comp_s0} and timestamp >= {t_q1} and timestamp < {t_mid} order_by comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE component_id = {comp_s0} AND timestamp >= {t_q1} AND timestamp < {t_mid} ORDER BY component_id, timestamp"
+               }
+    },
+    {
+      "name": "one component, 25% of the time span (dsos: timestamp index)",
+      "type": "component+time",
+      "match": { "where": "component_id == {comp_s0} and timestamp >= {t_q1} and timestamp < {t_mid}", "order_by": ["timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where component_id == {comp_s0} and timestamp >= {t_q1} and timestamp < {t_mid} order_by timestamp",
+                 "influxdb": "SELECT * FROM {schema} WHERE component_id = {comp_s0} AND timestamp >= {t_q1} AND timestamp < {t_mid} ORDER BY timestamp"
+               }
+    },
+    {
+      "name": "one component, 25% of the time span (dsos: job_comp_time index)",
+      "type": "component+time",
+      "match": { "where": "component_id == {comp_s0} and timestamp >= {t_q1} and timestamp < {t_mid}", "order_by": ["job_id", "component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where component_id == {comp_s0} and timestamp >= {t_q1} and timestamp < {t_mid} order_by job_comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE component_id = {comp_s0} AND timestamp >= {t_q1} AND timestamp < {t_mid} ORDER BY job_id, component_id, timestamp"
+               }
+    },
+    {
+      "name": "one job, all its components",
+      "type": "job",
+      "match": { "where": "job_id == {job_mid}", "order_by": ["job_id", "component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where job_id == {job_mid} order_by job_comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE job_id = {job_mid} ORDER BY job_id, component_id, timestamp"
+               }
+    },
+    {
+      "name": "one job, one component",
+      "type": "job+component",
+      "match": { "where": "job_id == {job_mid} and component_id == {comp_slast}", "order_by": ["job_id", "component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where job_id == {job_mid} and component_id == {comp_slast} order_by job_comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE job_id = {job_mid} AND component_id = {comp_slast} ORDER BY job_id, component_id, timestamp"
+               }
+    },
+    {
+      "name": "one job, one component, part of the job's time",
+      "type": "job+component+time",
+      "match": { "where": "job_id == {job_mid} and component_id == {comp_slast} and timestamp >= {t_mid}", "order_by": ["job_id", "component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where job_id == {job_mid} and component_id == {comp_slast} and timestamp >= {t_mid} order_by job_comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE job_id = {job_mid} AND component_id = {comp_slast} AND timestamp >= {t_mid} ORDER BY job_id, component_id, timestamp"
+               }
+    },
+    {
+      "name": "one job, part of its time, all components",
+      "type": "job+time",
+      "match": { "where": "job_id == {job_mid} and timestamp >= {t_mid}", "order_by": ["job_id", "component_id", "timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where job_id == {job_mid} and timestamp >= {t_mid} order_by job_comp_time",
+                 "influxdb": "SELECT * FROM {schema} WHERE job_id = {job_mid} AND timestamp >= {t_mid} ORDER BY job_id, component_id, timestamp"
+               }
+    },
+    {
+      "name": "condition on a metric value",
+      "type": "metric-value",
+      "match": { "where": "load < 4", "order_by": ["timestamp"] },
+      "query": {
+                 "dsos": "select * from {schema} where load < 4 order_by timestamp",
+                 "influxdb": "SELECT * FROM {schema} WHERE load < 4 ORDER BY timestamp"
+               }
+    },
+    {
+      "name": "selected columns, last 25% of the time span",
+      "type": "projection",
+      "match": { "where": "timestamp >= {t_q3}", "order_by": ["timestamp"] },
+      "query": {
+                 "dsos": "select component_id, seq, load from {schema} where timestamp >= {t_q3} order_by timestamp",
+                 "influxdb": "SELECT component_id, seq, load FROM {schema} WHERE timestamp >= {t_q3} ORDER BY timestamp"
+               }
+    },
+    {
+      "name": "first rows by time, with a limit",
+      "type": "limit",
+      "match": { "order_by": ["timestamp"], "limit": "{limit}" },
+      "query": {
+                 "dsos": "select * from {schema} order_by timestamp limit {limit}",
+                 "influxdb": "SELECT * FROM {schema} ORDER BY timestamp LIMIT {limit}"
+               }
+    },
+    {
+      "name": "group by job (exploratory)",
+      "type": "aggregate",
+      "verify": false,
+      "query": {
+                 "dsos": "select job_id from {schema} where job_id <= 3 group_by job_id",
+                 "influxdb": "SELECT job_id FROM {schema} WHERE job_id <= 3 GROUP BY job_id"
+               }
+    }
+  ]
+}

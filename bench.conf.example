@@ -1,0 +1,77 @@
+# monbench configuration -- sourced by bin/run.sh and bin/node.sh (bash syntax).
+# Every value may be overridden from the environment, e.g.
+#   SAMPLES=100 bin/run.sh -l ssh all
+# Backend-specific settings are in backends/<name>/backend.conf.
+
+# ---------------------------------------------------------------- backends
+# Which backend writes the data, and which queries it. Each is the name of a
+# directory under backends/. They are usually the same, but the primary
+# real-world case here is writing with sos and querying with dsos.
+#   sos      write local SOS containers (C or Python); no query adapter yet
+#   dsos     query SOS containers across servers through dsosd
+#   influxdb write and query InfluxDB v3
+WRITE_BACKEND="${WRITE_BACKEND:-sos}"
+QUERY_BACKEND="${QUERY_BACKEND:-dsos}"
+
+# ---------------------------------------------------------------- nodes
+# Server nodes (each holds one partition of the data set) and one query node.
+# The names must resolve from every node. With the Slurm launcher, unless
+# SERVER_NODES is set in the environment, the nodes come from the allocation:
+# the first two become servers and the third becomes the query node.
+SERVER_NODES="${SERVER_NODES:-node01 node02}"
+QUERY_NODE="${QUERY_NODE:-login01}"
+
+# ---------------------------------------------------------------- paths
+# BENCH_DIR must exist at the same path on all nodes. On a shared filesystem
+# nothing needs copying; otherwise run 'bin/run.sh -l ssh deploy'.
+BENCH_DIR="${BENCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Per-node scratch area for logs, pid files and generated files.
+RUN_DIR="${RUN_DIR:-/tmp/monbench-${USER:-$(id -un)}/run}"
+# Where write summaries, metadata files and query results are stored.
+RESULTS_DIR="${RESULTS_DIR:-${BENCH_DIR}/results}"
+
+# ---------------------------------------------------------------- software
+# Commands evaluated before every step on every node, e.g. to put the
+# backend's software on PATH, LD_LIBRARY_PATH and PYTHONPATH:
+#   ENV_SETUP="source /etc/profile.d/ovis.sh"
+ENV_SETUP="${ENV_SETUP:-}"
+PYTHON="${PYTHON:-python3}"
+
+# ---------------------------------------------------------------- data set
+# Data set definition (attributes and keys); see dataset/default.json.
+DATASET="${DATASET:-${BENCH_DIR}/dataset/default.json}"
+# Writers to run; each writes its own target, <DATA_NAME>_<writer>, so they
+# can be compared. Empty selects the backend's default writers.
+WRITERS="${WRITERS:-}"
+DATA_NAME="${DATA_NAME:-monitoring}"
+
+# Records per server = COMPONENTS_PER_NODE * SAMPLES (80,000 by default).
+COMPONENTS_PER_NODE="${COMPONENTS_PER_NODE:-16}"
+SAMPLES="${SAMPLES:-5000}"
+T0="${T0:-1700000000}"          # timestamp of sample 0 (seconds)
+INTERVAL="${INTERVAL:-1}"        # seconds between samples (integer)
+JOB_LEN="${JOB_LEN:-500}"        # samples per job; jobs span all servers
+BATCH="${BATCH:-10000}"          # records per write transaction
+
+# ---------------------------------------------------------------- queries
+# Query adapter within the query backend; empty selects its default.
+QUERY_ADAPTER="${QUERY_ADAPTER:-}"
+# Query set run by the check phase. Empty selects queries/default.json.
+QUERY_FILE="${QUERY_FILE:-}"
+# Timed runs per query, after one untimed run that is verified.
+REPEAT="${REPEAT:-5}"
+# Value of the {limit} placeholder in query sets.
+LIMIT_N="${LIMIT_N:-100}"
+
+# ---------------------------------------------------------------- live test
+LIVE_WRITER="${LIVE_WRITER:-}"   # empty = the first of WRITERS
+LIVE_TARGET="${LIVE_TARGET:-${DATA_NAME}_live}"
+LIVE_RATE="${LIVE_RATE:-2000}"   # records per second per server
+LIVE_BATCH="${LIVE_BATCH:-500}"
+LIVE_SAMPLES="${LIVE_SAMPLES:-1500}"
+LIVE_POLL="${LIVE_POLL:-2}"       # seconds between query-node polls
+
+# ---------------------------------------------------------------- launchers
+SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
+# Extra srun options; --overlap lets steps share nodes (Slurm >= 20.11).
+SRUN_OPTS="${SRUN_OPTS:---overlap}"
