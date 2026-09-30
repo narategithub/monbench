@@ -13,11 +13,15 @@
 #                and record a metadata file for each target
 #   serve-query  start the query backend's service on the servers, if it has one
 #                (skipped when it is the same service as serve-write)
-#   check        run the query set from the query node, once per target
+#   check        verify query results from the query node, once per target
+#                (no timing)
+#   query        time the query set from the query node, once per target
+#                (no verification)
 #   live         write a new target slowly while the query node polls it
 #   stop         stop both backend services
 #   clean        stop the services and delete the servers' data and run files
-#   all          build serve-write write serve-query check stop
+#   all          build serve-write write serve-query check query stop
+#   all-nocheck  build serve-write write serve-query query stop
 #
 # Launchers:
 #   ssh      run each step over ssh (default)
@@ -211,28 +215,6 @@ phase_build() {
 	done
 }
 
-summarise_writes() { # TARGET
-	local f line host
-	printf '   %-8s %-16s %10s %9s %9s %12s\n' writer host records write_s sync_s records/s
-	for f in "${LOG_DIR}/write-$1-"*.log; do
-		[[ -f "$f" ]] || continue
-		host="$(basename "$f" .log | sed "s/^write-$1-//")"
-		line="$(grep '^{' "$f" | tail -1 || true)"
-		if [[ -z "$line" ]]; then
-			printf '   %-8s %-16s %s\n' "?" "$host" "no summary; the write step failed (see $f)"
-			continue
-		fi
-		printf '%s\n' "$line" | "${PYTHON}" -c '
-import json, sys
-d = json.loads(sys.stdin.read())
-num = lambda k, f: (f % d[k]) if isinstance(d.get(k), (int, float)) else "-"
-print("   %-8s %-16s %10s %9s %9s %12s" % (d.get("writer", "?"), sys.argv[1],
-      num("records", "%d"), num("write_s", "%.2f"), num("close_sync_s", "%.2f"),
-      num("records_per_s", "%d")))
-' "$host" || true
-	done
-}
-
 phase_write() {
 	local w target
 	for w in ${WRITERS}; do
@@ -244,7 +226,6 @@ phase_write() {
 		else
 			FAILED=1
 		fi
-		[[ "$LAUNCHER" == "manual" ]] || summarise_writes "$target"
 	done
 }
 
@@ -322,6 +303,15 @@ phase_check() {
 	done
 }
 
+phase_query() {
+	local w target
+	for w in ${WRITERS}; do
+		target="${DATA_NAME}_${w}"
+		say "query: ${target} from ${QUERY_NODE}"
+		BE="${QUERY_BACKEND}" remote "${QUERY_NODE}" "query-${target}" query "$target" || FAILED=1
+	done
+}
+
 phase_live() {
 	say "live: ${LIVE_WRITER} writer at ${LIVE_RATE} records/s per server while ${QUERY_NODE} polls"
 	if [[ "$LAUNCHER" == "manual" ]]; then
@@ -363,11 +353,11 @@ echo "monbench: write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHE
 echo "          ${COMPONENTS_PER_NODE} components x ${SAMPLES} samples per server, writers: ${WRITERS}"
 PHASES=()
 for phase in "$@"; do
-	if [[ "$phase" == "all" ]]; then
-		PHASES+=(build serve-write write serve-query check stop)
-	else
-		PHASES+=("$phase")
-	fi
+	case "$phase" in
+	all)         PHASES+=(build serve-write write serve-query check query stop) ;;
+	all-nocheck) PHASES+=(build serve-write write serve-query query stop) ;;
+	*)           PHASES+=("$phase") ;;
+	esac
 done
 for phase in "${PHASES[@]}"; do
 	say "phase: ${phase}"
@@ -378,6 +368,7 @@ for phase in "${PHASES[@]}"; do
 	write) phase_write ;;
 	serve-query) phase_query_serve ;;
 	check) phase_check ;;
+	query) phase_query ;;
 	live) phase_live ;;
 	stop) phase_stop ;;
 	clean) phase_clean ;;

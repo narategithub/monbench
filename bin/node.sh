@@ -9,7 +9,8 @@
 #   node.sh meta TARGET WRITER full|live           record what was written
 #   node.sh serve-start ID | serve-run ID          start the backend service
 #   node.sh serve-stop | serve-status              stop / check it
-#   node.sh check TARGET [live]                    run the query set (query node)
+#   node.sh check TARGET [live]                    verify query results (query node)
+#   node.sh query TARGET                           time the query set (query node)
 #   node.sh clean ID                               delete this server's data
 set -euo pipefail
 
@@ -84,9 +85,9 @@ cmd_write() { # WRITER TARGET MODE INDEX ID
 	return "$rc"
 }
 
-cmd_check() { # TARGET [live]
-	local args=(--target "$1")
-	[[ "${2:-}" == "live" ]] && args+=(--live)
+cmd_bench() { # MODE TARGET [live]
+	local args=(--target "$2" --mode "$1")
+	[[ "${3:-}" == "live" ]] && args+=(--live)
 	"${PYTHON:-}" "${BENCH_DIR}/core/bench.py" "${args[@]}"
 }
 
@@ -100,7 +101,8 @@ serve-start) hook serve_start "$@" ;;
 serve-run) hook serve_run "$@" ;;
 serve-stop) hook serve_stop ;;
 serve-status) hook serve_status ;;
-check) cmd_check "$@" ;;
+check) cmd_bench check "$@" ;;
+query) cmd_bench query "$@" ;;
 clean) hook clean "$@" ;;
 *) sed -n '2,14p' "$0"; exit 2 ;;
 esac

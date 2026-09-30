@@ -100,7 +100,7 @@ data written earlier.
 
 ```bash
 bin/run.sh -l ssh deploy          # only if the directory is not shared
-bin/run.sh -l ssh all             # build serve-write write serve-query check stop
+bin/run.sh -l ssh all             # build serve-write write serve-query check query stop
 ```
 
 **Slurm** (inside an allocation of at least three nodes; the first two
@@ -130,7 +130,8 @@ service running between checks:
 bin/run.sh serve-write   # start the write backend's service, if it has one
 bin/run.sh write
 bin/run.sh serve-query   # start the query backend's service
-bin/run.sh check
+bin/run.sh check         # verify query results (no timing)
+bin/run.sh query         # time the query set (no verification)
 bin/run.sh live          # concurrent write-and-query test
 bin/run.sh stop          # stop both services
 bin/run.sh clean         # stop the services and delete the data

@@ -340,44 +340,62 @@ def percentile(values, p):
     return ordered[min(len(ordered) - 1, int(round(p / 100 * (len(ordered) - 1))))]
 
 
-def run_query_set(rep, adapter, queries):
+def run_query_set(rep, adapter, queries, mode="both"):
+    do_check = mode in ("check", "both")
+    do_time  = mode in ("query", "both")
     rep.width = max(len(f"[{q['type']}] {q['name']}") for q in queries)
-    print(f"  {'':5} {'query':{rep.width}} {'rows':>8} {'median ms':>10} {'p95 ms':>10}  detail")
+    if do_time:
+        print(f"  {'':5} {'query':{rep.width}} {'rows':>8} {'median ms':>10} {'p95 ms':>10}  detail")
+    else:
+        print(f"  {'':5} {'query':{rep.width}} {'rows':>8}  detail")
     for q in queries:
         label = f"[{q['type']}] {q['name']}"
         if not q["query"]:
             rep.add(label, "SKIP", f"no query string for adapter '{adapter.name}'")
             continue
-        # 1. Untimed run: fetch and verify the full result.
-        try:
-            columns, rows = collect(adapter, q["query"])
-        except Exception as e:
-            rep.add(label, "FAIL", f"{type(e).__name__}: {e}", query=q["query"])
+
+        status, detail = "INFO", ""
+        nrows = 0
+
+        # 1. Untimed verification run (check and both modes).
+        if do_check:
+            try:
+                columns, rows = collect(adapter, q["query"])
+            except Exception as e:
+                rep.add(label, "FAIL", f"{type(e).__name__}: {e}", query=q["query"])
+                continue
+            nrows = len(rows)
+            if q["spec"]:
+                status, detail = verify(q["spec"], columns, rows)
+            else:
+                status, detail = "INFO", q["unverified_reason"]
+                if q["type"] == "aggregate" and columns and rows:
+                    groups = {}
+                    for r in rows:
+                        groups[r.get(columns[0])] = groups.get(r.get(columns[0]), 0) + 1
+                    detail += f"; {len(groups)} groups, rows per group {sorted(set(groups.values()))}"
+
+        if not do_time:
+            rep.add(label, status, detail, query=q["query"], rows=nrows)
             continue
-        if q["spec"]:
-            status, detail = verify(q["spec"], columns, rows)
-        else:
-            status, detail = "INFO", q["unverified_reason"]
-            if q["type"] == "aggregate" and columns and rows:
-                groups = {}
-                for r in rows:
-                    groups[r.get(columns[0])] = groups.get(r.get(columns[0]), 0) + 1
-                detail += f"; {len(groups)} groups, rows per group {sorted(set(groups.values()))}"
-        # 2. Timed runs.
+
+        # 2. Timed runs (query and both modes).
         times = []
         try:
-            for _ in range(REPEAT):
+            for i in range(REPEAT):
                 t, n = timed_run(adapter, q["query"])
                 times.append(t)
-                if n != len(rows):
-                    status, detail = "FAIL", f"row count changed between runs ({len(rows)} then {n})"
+                if nrows == 0 and i == 0:
+                    nrows = n       # first timed run establishes the baseline in query-only mode
+                elif n != nrows:
+                    status, detail = "FAIL", f"row count changed between runs ({nrows} then {n})"
         except Exception as e:
             status, detail = "FAIL", f"timed run failed: {type(e).__name__}: {e}"
-        fields = {"query": q["query"], "rows": len(rows), "times_s": [round(t, 6) for t in times]}
+        fields = {"query": q["query"], "rows": nrows, "times_s": [round(t, 6) for t in times]}
         if times:
             med = statistics.median(times)
             fields.update(median_s=med, p95_s=percentile(times, 95), min_s=min(times),
-                          rows_per_s=round(len(rows) / med) if med > 0 else None)
+                          rows_per_s=round(nrows / med) if med > 0 else None)
         rep.add(label, status, detail, **fields)
 
 
@@ -441,28 +459,30 @@ def print_ingest_summary(ingest):
     if not nodes:
         print("  (no ingest result files found)")
         return
-    w = max(len(n.get("host", "")) for n in nodes)
-    print(f"  {'host':{w}}  {'writer':6}  {'backend':8}  {'storage':9}"
-          f"  {'records':>10}  {'write_s':>8}  {'sync_s':>7}  {'records/s':>10}")
+    hw = max(len(n.get("host", "")) for n in nodes)
+    hw = max(hw, len("total/max"))
+    print(f"  {'host':{hw}}  {'writer':>6}  {'records':>10}  {'write_s':>8}"
+          f"  {'sync_s':>7}  {'records/s':>10}")
     for n in nodes:
         host = n.get("host", "?")
         if "error" in n:
-            print(f"  {host:{w}}  {n['error']}")
+            print(f"  {host:{hw}}  {n['error']}")
             continue
-        def fmt(key, f):
-            v = n.get(key, "-")
-            return f.format(v) if isinstance(v, (int, float)) else f"{v:>10}"
-        print(f"  {host:{w}}  {n.get('writer','-'):6}  {n.get('backend','-'):8}  {n.get('storage','-'):9}"
-              f"  {fmt('records', '{:>10d}')}  {fmt('write_s', '{:>8.2f}')}  {fmt('sync_s', '{:>7.2f}')}"
-              f"  {fmt('records_per_s', '{:>10d}')}")
+        def num(key, spec):
+            v = n.get(key)
+            return spec.format(v) if isinstance(v, (int, float)) else "-"
+        print(f"  {host:{hw}}  {n.get('writer','-'):>6}  {num('records', '{:>10d}')}"
+              f"  {num('write_s', '{:>8.2f}')}"
+              f"  {num('sync_s', '{:>7.2f}')}"
+              f"  {num('records_per_s', '{:>10d}')}")
     sm = ingest.get("summary", {})
     if sm:
-        print(f"  {'total/max':{w}}  {'':6}  {'':8}  {'':9}"
-              f"  {sm.get('total_records',0):>10d}  {sm['max_write_s']:.2f}"
-              f"  {sm['max_sync_s']:.2f}  {sm.get('aggregate_records_per_s','-'):>10}")
+        print(f"  {'total/max':{hw}}  {'':>6}  {sm.get('total_records',0):>10d}"
+              f"  {sm['max_write_s']:>8.2f}  {sm['max_sync_s']:>7.2f}"
+              f"  {sm.get('aggregate_records_per_s','-'):>10}")
 
 
-def run_checks(target, query_file):
+def run_checks(target, query_file, mode="both"):
     cls = load_plugin()
     source = load_dataset(target, live=False)
     adapter = make_adapter(cls, target)
@@ -477,13 +497,17 @@ def run_checks(target, query_file):
     except BackendError as e:
         sys.exit(f"bench.py: backend '{BACKEND}' check failed: {e}")
     queries = load_query_set(query_file, adapter)
-    print(f"\nQuery benchmark  [adapter: {adapter.name}]")
-    print(f"  {query_file} — {len(queries)} queries, "
-          f"1 verified run + {REPEAT} timed runs each")
+
+    mode_desc = {"check": "verification only (no timing)",
+                 "query": f"{REPEAT} timed runs each (no verification)",
+                 "both":  f"1 verified run + {REPEAT} timed runs each"}
+    print(f"\nQuery benchmark  [adapter: {adapter.name}, mode: {mode}]")
+    print(f"  {query_file} — {len(queries)} queries, {mode_desc[mode]}")
+
     rep = Report(target, adapter.name)
     rep.ingest = ingest
     try:
-        run_query_set(rep, adapter, queries)
+        run_query_set(rep, adapter, queries, mode=mode)
     finally:
         adapter.close()
     return rep
@@ -542,6 +566,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--target", required=True,
                    help="name of the written data (container, database, ...)")
+    p.add_argument("--mode", choices=("check", "query", "both"), default="both",
+                   help="check = verify only (no timing); "
+                        "query = time only (no verification); "
+                        "both = verify then time (default)")
     p.add_argument("--live", action="store_true")
     p.add_argument("--queries", default=QUERY_FILE,
                    help="query set file (default: QUERY_FILE, or queries/default.json)")
@@ -552,7 +580,7 @@ def main():
     log_path = os.path.join(RESULTS_DIR, f"benchmark-{a.target}{suffix}.log")
     tee = Tee(log_path)
     try:
-        rep = run_live(a.target) if a.live else run_checks(a.target, a.queries)
+        rep = run_live(a.target) if a.live else run_checks(a.target, a.queries, mode=a.mode)
     finally:
         tee.close()
 
@@ -588,6 +616,7 @@ def main():
             "backend": QUERY_BACKEND,
             "adapter": rep.adapter,
             "query_file": None if a.live else a.queries,
+            "mode": a.mode,
             "repeat": REPEAT,
             "results": query_results,
         },
