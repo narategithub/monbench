@@ -34,6 +34,7 @@ starting point for others.
 | `backends/template/` | Skeleton for a new backend |
 | `slurm/monbench.sbatch` | Batch script for a Slurm job |
 | `ROADMAP.md` | Current limitations, and what is planned or deferred, with the reasons |
+| `OUTPUT.md` | Result file structure, JSON schema, and timing measurement boundaries |
 
 ## Choosing a backend
 
@@ -242,14 +243,17 @@ set so that one file works at any size:
 
 ## Output
 
-- `results/write-<target>-<host>.json`: one line per writer run, including
-  records written, time to write, time for the final sync, and records per
-  second.
+- `results/write-<target>-<host>.json`: one JSON object per writer run,
+  including records written, time to write, time for the final sync, and
+  records per second.
 - `results/meta/<target>.json`: what was written to each target.
-- `results/check-<target>-<adapter>.json`: each query with its expanded
-  query string, status, row count, every timed run, median, p95, minimum and
-  rows per second.
+- `results/benchmark-<target>-<adapter>.json`: each query with its
+  expanded query string, status, row count, every timed run, median, p95,
+  minimum and rows per second.
 - `results/logs/`: the full output of every remote step.
+
+See `OUTPUT.md` for the full JSON structure, what each field means, and
+exactly what the write and query timing measurements cover.
 
 ## Assumptions and limits
 
