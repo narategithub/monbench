@@ -53,7 +53,7 @@ query set under the `influxdb` adapter name.
 
 ## Configuration
 
-Settings live in `backends/influxdb/backend.conf` (override from the
+Settings live in `backends/influxdb/influxdb_backend.conf` (override from the
 environment):
 
 | Setting | Default | Purpose |

@@ -1,7 +1,7 @@
 # monbench configuration -- sourced by bin/run.sh and bin/node.sh (bash syntax).
 # Every value may be overridden from the environment, e.g.
 #   SAMPLES=100 bin/run.sh -l ssh all
-# Backend-specific settings are in backends/<name>/backend.conf.
+# Backend-specific settings are in backends/<name>/<name>_backend.conf.
 
 # ---------------------------------------------------------------- backends
 # Which backend writes the data, and which queries it. Each is the name of a

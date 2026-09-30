@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""check.py -- run a query set against one backend, verify it, and time it.
+"""bench.py -- benchmark and verify queries against one backend.
 
-Runs on the query node (normally through 'bin/node.sh check'). Settings come
-from the environment exported by node.sh from bench.conf and the backend's
-backend.conf.
+Runs on the query node (normally through 'bin/node.sh check' or
+'bin/node.sh query'). Settings come from the environment exported by
+node.sh from bench.conf and the backend's <name>_backend.conf.
 
 The engine is backend-neutral. It loads the query adapter from the backend
-plugin (backends/<BACKEND>/query.py), connects once, then for each query in
-the query set
-  1. runs the query once, untimed, and verifies the full result against the
-     data set (core/dataset.py);
-  2. runs it REPEAT more times, timing each run from the start of the query
-     until the last row has been fetched.
+plugin (backends/<BACKEND>/query/<BACKEND>_query.py), connects once, then for each query in
+the query set runs one or both of the following steps:
+
+  check  Run the query once, untimed, and verify the full result against the
+         data set (core/dataset.py).
+  query  Run the query REPEAT times, timing each run from the start of the
+         query until the last row has been fetched.
 
 The data set parameters come from the target's metadata file, written when
 the target was written. If it names a different backend, the run stops.
@@ -38,7 +39,7 @@ from dataset import ATTRS, Dataset, read_meta         # noqa: E402
 def env(name, cast=str, default=None):
     value = os.environ.get(name, default)
     if value is None:
-        sys.exit(f"check.py: {name} is not set; run through bin/node.sh")
+        sys.exit(f"bench.py: {name} is not set; run through bin/node.sh")
     return cast(value)
 
 
@@ -46,7 +47,7 @@ BENCH_DIR = env("BENCH_DIR")
 BACKEND = env("BACKEND")               # the query backend (set by run.sh)
 QUERY_BACKEND = os.environ.get("QUERY_BACKEND", BACKEND)
 WRITE_BACKEND = os.environ.get("WRITE_BACKEND", BACKEND)
-# Backends whose data this query backend can read (from its backend.conf).
+# Backends whose data this query backend can read (from its <name>_backend.conf).
 PLUGIN_READS = os.environ.get("PLUGIN_READS", "").split()
 SERVERS = env("SERVER_NODES").split()
 RUN_DIR = env("RUN_DIR")
@@ -61,16 +62,16 @@ DS = None          # the Dataset being checked; set in main()
 
 
 def load_plugin():
-    """Load backends/<BACKEND>/query.py and return (module, adapter class)."""
-    path = os.path.join(BENCH_DIR, "backends", BACKEND, "query.py")
+    """Load backends/<BACKEND>/query/<BACKEND>_query.py and return (module, adapter class)."""
+    path = os.path.join(BENCH_DIR, "backends", BACKEND, "query", f"{BACKEND}_query.py")
     if not os.path.exists(path):
-        sys.exit(f"check.py: backend '{BACKEND}' has no query adapter ({path})")
+        sys.exit(f"bench.py: backend '{BACKEND}' has no query adapter ({path})")
     spec = importlib.util.spec_from_file_location(f"backend_{BACKEND}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     name = QUERY_ADAPTER or module.DEFAULT_ADAPTER
     if name not in module.ADAPTERS:
-        sys.exit(f"check.py: backend '{BACKEND}' has no adapter '{name}'; "
+        sys.exit(f"bench.py: backend '{BACKEND}' has no adapter '{name}'; "
                  f"available: {', '.join(sorted(module.ADAPTERS))}")
     return module.ADAPTERS[name]
 
@@ -160,7 +161,7 @@ def fill(value, values, where):
         try:
             return value.format(**values)
         except KeyError as e:
-            sys.exit(f"check.py: {where} uses unknown placeholder {e}; "
+            sys.exit(f"bench.py: {where} uses unknown placeholder {e}; "
                      f"available: {', '.join(sorted(values))}")
     if isinstance(value, dict):
         return {k: fill(v, values, where) for k, v in value.items()}
@@ -195,7 +196,7 @@ def load_query_set(path, adapter):
         doc = json.load(f)
     queries = doc.get("queries")
     if not isinstance(queries, list) or not queries:
-        sys.exit(f"check.py: {path} has no 'queries' list")
+        sys.exit(f"bench.py: {path} has no 'queries' list")
     values = DS.placeholders(LIMIT_N)
     out = []
     for n, q in enumerate(queries):
@@ -204,7 +205,7 @@ def load_query_set(path, adapter):
         if isinstance(text, dict):                       # per backend or dialect
             text = text.get(adapter.name, text.get(adapter.dialect))
         if text is None and "query" not in q:
-            sys.exit(f"check.py: {where} has no 'query'")
+            sys.exit(f"bench.py: {where} has no 'query'")
         match = q.get("match")
         spec, reason = (parse_match(fill(match, values, where)) if match
                         else (None, "no 'match' description"))
@@ -387,7 +388,7 @@ def load_dataset(target, live):
     if meta:
         wrote = meta["backend"]
         if PLUGIN_READS and wrote not in PLUGIN_READS:
-            sys.exit(f"check.py: target '{target}' was written by backend "
+            sys.exit(f"bench.py: target '{target}' was written by backend "
                      f"'{wrote}', which query backend '{QUERY_BACKEND}' cannot "
                      f"read (it reads: {', '.join(PLUGIN_READS)})")
         DS = Dataset.from_meta(meta)
@@ -426,7 +427,7 @@ def load_ingest_results(target):
         summary = {
             "total_records": sum(n["records"] for n in ok),
             "max_write_s": max(n["write_s"] for n in ok if n.get("write_s")),
-            "max_sync_s": max(n["sync_s"] for n in ok if n.get("sync_s")),
+            "max_sync_s": max((n["sync_s"] for n in ok if n.get("sync_s")), default=0),
         }
         elapsed = summary["max_write_s"] + summary["max_sync_s"]
         if elapsed > 0:
@@ -474,7 +475,7 @@ def run_checks(target, query_file):
     try:
         adapter.connect()
     except BackendError as e:
-        sys.exit(f"check.py: backend '{BACKEND}' check failed: {e}")
+        sys.exit(f"bench.py: backend '{BACKEND}' check failed: {e}")
     queries = load_query_set(query_file, adapter)
     print(f"\nQuery benchmark  [adapter: {adapter.name}]")
     print(f"  {query_file} — {len(queries)} queries, "
@@ -499,7 +500,7 @@ def run_live(target):
     text = next((q["query"] for q in load_query_set(QUERY_FILE, cls)
                  if q["type"] == "all" and q["query"]), None)
     if not text:
-        sys.exit(f"check.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
+        sys.exit(f"bench.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
     print(f"Polling '{target}' every {LIVE_POLL}s until {final} rows")
     counts, invalid, errors = [], 0, 0
     deadline = time.monotonic() + 600

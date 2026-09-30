@@ -6,7 +6,7 @@
           starts a dsosql process that connects to every server, so timings
           include that start-up; useful as a cross-check only.
 
-Settings (backends/sos/backend.conf): SOS_ROW_LIMIT, DSOSQL.
+Settings (backends/dsos/dsos_backend.conf): SOS_ROW_LIMIT, DSOSQL.
 """
 import os
 import re

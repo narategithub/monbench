@@ -17,7 +17,7 @@ Query sets address these adapters by name or by dialect:
   adapter key:  "influxdb" or "influxdb-http"
   dialect key:  "sql" or "influxql"
 
-Settings (from backend.conf / environment):
+Settings (from influxdb_backend.conf / environment):
   INFLUX_HOST         server URL, e.g. http://localhost:8181
   INFLUX_DATABASE     database name
   INFLUX_TOKEN_FILE   path to the JSON token file written by serve-start

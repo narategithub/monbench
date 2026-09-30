@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # node.sh -- actions executed on one node. bin/run.sh calls this script
 # through ssh, srun, or by printing the command for you to run by hand.
-# Backend-specific work is delegated to backends/<BACKEND>/plugin.sh.
+# Backend-specific work is delegated to backends/<BACKEND>/<BACKEND>_plugin.sh.
 #
 #   node.sh build                                  build the backend's writers
 #   node.sh write WRITER TARGET full|live INDEX ID write data-set partition INDEX
@@ -23,8 +23,8 @@ source "$CONF"
 # the plugin to load. Falls back to WRITE_BACKEND when not set.
 BACKEND="${BE:-${BACKEND:-${WRITE_BACKEND}}}"
 PLUGIN_DIR="${BENCH_DIR}/backends/${BACKEND}"
-[[ -f "${PLUGIN_DIR}/plugin.sh" ]] || { echo "error: unknown backend '${BACKEND}' (no ${PLUGIN_DIR}/plugin.sh)" >&2; exit 1; }
-source "${PLUGIN_DIR}/backend.conf"
+[[ -f "${PLUGIN_DIR}/${BACKEND}_plugin.sh" ]] || { echo "error: unknown backend '${BACKEND}' (no ${PLUGIN_DIR}/${BACKEND}_plugin.sh)" >&2; exit 1; }
+source "${PLUGIN_DIR}/${BACKEND}_backend.conf"
 WRITERS="${WRITERS:-${DEFAULT_WRITERS:-}}"
 set +a
 # Site profile scripts are written for interactive shells and often reference
@@ -49,8 +49,8 @@ all_targets() {
 	echo "${LIVE_TARGET:-}"
 }
 
-# shellcheck source=../backends/sos/plugin.sh
-source "${PLUGIN_DIR}/plugin.sh"
+# shellcheck source=../backends/sos/sos_plugin.sh
+source "${PLUGIN_DIR}/${BACKEND}_plugin.sh"
 
 # Run a plugin hook if the backend defines it.
 hook() { # NAME ARGS...
@@ -87,7 +87,7 @@ cmd_write() { # WRITER TARGET MODE INDEX ID
 cmd_check() { # TARGET [live]
 	local args=(--target "$1")
 	[[ "${2:-}" == "live" ]] && args+=(--live)
-	"${PYTHON:-}" "${BENCH_DIR}/core/check.py" "${args[@]}"
+	"${PYTHON:-}" "${BENCH_DIR}/core/bench.py" "${args[@]}"
 }
 
 action="${1:-}"

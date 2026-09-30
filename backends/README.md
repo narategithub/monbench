@@ -6,20 +6,23 @@ directory per backend:
 
 ```
 backends/<name>/
-  backend.conf   settings and declarations
-  plugin.sh      lifecycle hooks: build, write, serve, stop, clean
-  query.py       query adapters
-  ...            anything else the backend needs (writers, tools)
+  <name>_backend.conf   settings and declarations
+  <name>_plugin.sh      lifecycle hooks: build, write, serve, stop, clean
+  query/<name>_query.py  query adapters
+  writer/                writers (if any)
+  ...                    anything else the backend needs (tools, etc.)
 ```
 
 Selecting a backend is a single setting, `BACKEND=<name>` in `bench.conf`. If
 the directory does not exist, or lacks a required file, the run stops with
 an error before doing anything.
 
-To add a backend, copy `backends/template/` to `backends/<name>/` and fill it
-in. `backends/sos/` is a complete example.
+To add a backend, copy `backends/template/` to `backends/<name>/` and rename
+each file with your backend's name as a prefix: `<name>_plugin.sh`,
+`<name>_backend.conf`, `query/<name>_query.py`. `backends/sos/` is a complete
+example.
 
-## backend.conf
+## `<name>_backend.conf`
 
 Sourced after `bench.conf`, so it can use core settings such as `RUN_DIR`.
 Use the `NAME="${NAME:-default}"` form so every value can be overridden from
@@ -28,10 +31,10 @@ the environment. Three declarations are read by the core:
 | Setting | Meaning |
 |---|---|
 | `DEFAULT_WRITERS` | Writers used when `WRITERS` is empty, e.g. `"c py"` |
-| `PLUGIN_SERVICE` | `1` if the harness must start and stop a service on the server nodes (the `serve-write` or `serve` phase, depending on whether the backend is the write or query backend, and the `stop` phase); `0` if the backend needs no service or its service is managed elsewhere |
+| `PLUGIN_SERVICE` | `1` if the harness must start and stop a service on the server nodes (the `serve-write` or `serve-query` phase, depending on whether the backend is the write or query backend, and the `stop` phase); `0` if the backend needs no service or its service is managed elsewhere |
 | `PLUGIN_VARS` | The plugin's own settings, space-separated, so they are forwarded to remote steps |
 
-## plugin.sh
+## `<name>_plugin.sh`
 
 Sourced by `bin/node.sh` on the node where a step runs. It defines shell
 functions; `plugin_write` is required, the others are optional and skipped
@@ -53,7 +56,7 @@ database, a bucket. The harness writes one target per writer,
 lists them all.
 
 Available to hooks: `HOST` (short host name), `PLUGIN_DIR`, the helpers
-`log` and `die`, every setting from `bench.conf` and `backend.conf`, and, in
+`log` and `die`, every setting from `bench.conf` and `<name>_backend.conf`, and, in
 `plugin_write`, the array `dataset_args`.
 
 ### Writers
@@ -83,7 +86,7 @@ After all servers have written a target, the harness writes
 parameters. The query engine reads it to verify against the data actually
 written, and refuses to query a target written for a different backend.
 
-## query.py
+## `query/<name>_query.py`
 
 Defines one or more query adapters, subclasses of `Adapter` from
 `core/adapter.py`, plus two module attributes:
@@ -134,7 +137,7 @@ is not partitioned the way `sos`/`dsos` are: each server node generates its own
 partition of the data set and sends it to the same `INFLUX_HOST`. Together the
 nodes write the whole data set once.
 
-Two options in `backends/influxdb/backend.conf`:
+Two options in `backends/influxdb/influxdb_backend.conf`:
 
 - `INFLUX_INTERFACE`: `python` (the `influxdb_client_3` library, default) or
   `http` (POST line protocol to the v3 write API with no extra dependency).

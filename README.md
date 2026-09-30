@@ -25,7 +25,7 @@ starting point for others.
 | `bin/run.sh` | Driver: runs each phase on the right nodes via ssh, Slurm or by hand |
 | `bin/node.sh` | Actions executed on a single node; calls the backend's hooks |
 | `core/dataset.py` | The data set: value rules, parameters, metadata files |
-| `core/check.py` | Query engine: runs a query set, verifies and times each query |
+| `core/bench.py` | Query engine: runs a query set, verifies and times each query |
 | `core/adapter.py` | The interface query adapters implement |
 | `dataset/default.json` | Data set definition: attributes and keys |
 | `queries/default.json` | Default query set, used when `QUERY_FILE` is empty |
@@ -38,7 +38,7 @@ starting point for others.
 ## Choosing a backend
 
 Set `BACKEND` in `bench.conf` to the name of a directory under `backends/`.
-That backend's `backend.conf` holds its own settings (for SOS: installation
+That backend's `<name>_backend.conf` holds its own settings (for SOS: installation
 prefix, container location, storage type, `dsosd` command). The run stops
 with an error if the backend does not exist, if its data was written for a
 different backend, or if the query adapter cannot reach it.
@@ -92,7 +92,7 @@ data written earlier.
 
 1. Edit `bench.conf`: at minimum `BACKEND`, `SERVER_NODES`, `QUERY_NODE` and,
    if the backend's software is not on the default paths, `ENV_SETUP`.
-2. Edit `backends/<BACKEND>/backend.conf` for that backend (for SOS,
+2. Edit `backends/<BACKEND>/<BACKEND>_backend.conf` for that backend (for SOS,
    `SOS_PREFIX`).
 3. Run one of the following.
 
@@ -100,7 +100,7 @@ data written earlier.
 
 ```bash
 bin/run.sh -l ssh deploy          # only if the directory is not shared
-bin/run.sh -l ssh all             # build serve-write write serve check stop
+bin/run.sh -l ssh all             # build serve-write write serve-query check stop
 ```
 
 **Slurm** (inside an allocation of at least three nodes; the first two
@@ -129,7 +129,7 @@ service running between checks:
 ```bash
 bin/run.sh serve-write   # start the write backend's service, if it has one
 bin/run.sh write
-bin/run.sh serve         # start the query backend's service
+bin/run.sh serve-query   # start the query backend's service
 bin/run.sh check
 bin/run.sh live          # concurrent write-and-query test
 bin/run.sh stop          # stop both services
@@ -275,7 +275,7 @@ Design limitations and plans for later versions are tracked in `ROADMAP.md`.
   The `group_by` query in the default set is a best guess and is not
   verified. Time binning (resampling) is not tested yet, for the same reason.
 - **Registering `dsosd` with `rpcbind` may require root.** If so, set
-  `DSOSD="sudo -E dsosd"` in `backends/sos/backend.conf`. `-E` is needed so that `DSOSD_DIRECTORY` and
+  `DSOSD="sudo -E dsosd"` in `backends/dsos/dsos_backend.conf`. `-E` is needed so that `DSOSD_DIRECTORY` and
   `DSOSD_SERVER_ID` reach `dsosd`. Stopping it then also requires sudo.
 - **The Python writer cannot request a synchronous close.** The bindings do
   not export `SOS_COMMIT_SYNC`, so the writer calls `os.sync()` after closing

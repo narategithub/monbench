@@ -1,12 +1,12 @@
 """adapter.py -- the interface every backend's query adapter implements.
 
-A backend plugin provides backends/<name>/query.py, which defines one or more
+A backend plugin provides backends/<name>/query/<name>_query.py, which defines one or more
 subclasses of Adapter and two module attributes:
 
     ADAPTERS = {"<adapter-name>": AdapterClass, ...}
     DEFAULT_ADAPTER = "<adapter-name>"
 
-The engine (core/check.py) loads that module by file path, so plugins need no
+The engine (core/bench.py) loads that module by file path, so plugins need no
 installation and no change to the core.
 """
 

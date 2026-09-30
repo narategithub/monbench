@@ -1,10 +1,12 @@
-# plugin.sh -- backend hooks, sourced by bin/node.sh. Copy and fill in.
-# See backends/README.md for what each hook must do. Hooks you do not define
-# are skipped; plugin_write is required.
+# <name>_plugin.sh -- backend hooks, sourced by bin/node.sh. Copy this
+# directory to backends/<name>/ and rename each file with your backend's
+# name as a prefix: <name>_plugin.sh, <name>_backend.conf,
+# query/<name>_query.py. See backends/README.md for what each hook must do.
+# Hooks you do not define are skipped; plugin_write is required.
 #
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets,
 # dataset_args (array, in plugin_write), and every setting from bench.conf
-# and backend.conf.
+# and <name>_backend.conf.
 
 # plugin_build() {
 # 	: # compile writers, if any

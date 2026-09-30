@@ -1,4 +1,4 @@
-# plugin.sh -- InfluxDB v3 Core hooks, sourced by bin/node.sh when BACKEND=influxdb.
+# influxdb_plugin.sh -- InfluxDB v3 Core hooks, sourced by bin/node.sh when BACKEND=influxdb.
 #
 # Hooks (see backends/README.md for the contract):
 #   plugin_write       WRITER TARGET MODE INDEX ID  write one partition
@@ -13,22 +13,20 @@
 #
 # No build step (the writer is Python).
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, dataset_args (array),
-# and every setting from bench.conf and backend.conf.
+# and every setting from bench.conf and influxdb_backend.conf.
 
 INFLUX_DIR="${BENCH_DIR}/backends/influxdb"
 
 # All runtime files live under RUN_DIR so the harness owns the full lifecycle
 # and clean wipes everything in one place.
-INFLUX_DATA_DIR="${INFLUX_DATA_DIR:-${RUN_DIR}/influxdb3}"
 _INFLUX_PID="${RUN_DIR}/influxdb3.pid"
 _INFLUX_LOG="${RUN_DIR}/influxdb3.log"
-# The generated admin token is written here by serve-start and read by write
-# and check via INFLUX_TOKEN_FILE.
-INFLUX_TOKEN_FILE="${RUN_DIR}/influxdb3-token.json"
 
 # ----------------------------------------------------------------- write
 
 plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
+	log "token file: ${INFLUX_TOKEN_FILE}"
+	log "token: $(_influx_read_token)"
 	local writer="$1" target="$2" index="$4"
 	[[ "$writer" == "influx" ]] ||
 		die "the influxdb backend has no writer '$writer' (available: influx)"
@@ -71,6 +69,10 @@ _influx_read_token() {
 
 plugin_serve_start() { # SERVER_ID
 	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
+
+        # Kill any leftover process from a previous run before starting a new one.
+        pkill -f 'influxdb3 serve' 2>/dev/null || true
+        sleep 1
 
 	# Generate an admin token offline so we have it before the server starts.
 	# --offline writes a JSON file; the server is then started with that file
@@ -141,4 +143,5 @@ plugin_clean() { # SERVER_ID
 		log "removed ${INFLUX_DATA_DIR}"
 	fi
 	rm -f "${INFLUX_TOKEN_FILE}"
+	log "removed token at ${INFLUX_TOKEN_FILE}"
 }

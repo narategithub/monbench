@@ -1,4 +1,4 @@
-# plugin.sh -- SOS storage hooks, sourced by bin/node.sh when BACKEND is sos
+# sos_plugin.sh -- SOS storage hooks, sourced by bin/node.sh when BACKEND is sos
 # or dsos. The dsos plugin sources this file for its write side.
 #
 # This backend writes one local SOS container per server, using the SOS API.
@@ -11,7 +11,7 @@
 #   plugin_clean ID                           delete this server's containers
 #
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets,
-# dataset_args (array), and every setting from bench.conf and backend.conf.
+# dataset_args (array), and every setting from bench.conf and sos_backend.conf.
 
 # This file's own directory, which is not PLUGIN_DIR when dsos sources it.
 SOS_DIR="${BENCH_DIR}/backends/sos"

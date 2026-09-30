@@ -36,7 +36,7 @@ The C writer is built by `bin/run.sh build`; the Python writer needs the
 
 ## Configuration
 
-Settings live in `backends/sos/backend.conf` (override from the environment):
+Settings live in `backends/sos/sos_backend.conf` (override from the environment):
 
 | Setting | Default | Purpose |
 |---|---|---|

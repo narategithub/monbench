@@ -11,13 +11,13 @@
 #   serve-write  start the write backend's service on the servers, if it has one
 #   write        write the data set on the servers, once per writer in WRITERS,
 #                and record a metadata file for each target
-#   serve        start the query backend's service on the servers, if it has one
+#   serve-query  start the query backend's service on the servers, if it has one
 #                (skipped when it is the same service as serve-write)
 #   check        run the query set from the query node, once per target
 #   live         write a new target slowly while the query node polls it
 #   stop         stop both backend services
 #   clean        stop the services and delete the servers' data and run files
-#   all          build serve-write write serve check stop
+#   all          build serve-write write serve-query check stop
 #
 # Launchers:
 #   ssh      run each step over ssh (default)
@@ -55,22 +55,22 @@ fi
 source "$CONF"
 
 check_plugin() { # NAME
-	[[ -f "${BENCH_DIR}/backends/$1/backend.conf" && -f "${BENCH_DIR}/backends/$1/plugin.sh" ]] ||
+	[[ -f "${BENCH_DIR}/backends/$1/${1}_backend.conf" && -f "${BENCH_DIR}/backends/$1/${1}_plugin.sh" ]] ||
 		{ echo "unknown backend '$1': no plugin in ${BENCH_DIR}/backends/$1" >&2; exit 1; }
 }
 check_plugin "${WRITE_BACKEND}"
 check_plugin "${QUERY_BACKEND}"
 
 # The write backend supplies the writers and their default settings.
-# shellcheck source=../backends/sos/backend.conf
-source "${BENCH_DIR}/backends/${WRITE_BACKEND}/backend.conf"
+# shellcheck source=../backends/sos/sos_backend.conf
+source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
 WRITERS="${WRITERS:-${DEFAULT_WRITERS:-}}"
 LIVE_WRITER="${LIVE_WRITER:-${WRITERS%% *}}"
 # Does the write backend require a service on the servers?
 W_SERVICE=0
 {
 	PLUGIN_SERVICE=0
-	source "${BENCH_DIR}/backends/${WRITE_BACKEND}/backend.conf"
+	source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
 	W_SERVICE="${PLUGIN_SERVICE:-0}"
 } 2>/dev/null
 
@@ -79,14 +79,14 @@ Q_SERVICE=0
 Q_READS=""
 {
 	PLUGIN_SERVICE=0 PLUGIN_READS=""
-	source "${BENCH_DIR}/backends/${QUERY_BACKEND}/backend.conf"
+	source "${BENCH_DIR}/backends/${QUERY_BACKEND}/${QUERY_BACKEND}_backend.conf"
 	Q_SERVICE="${PLUGIN_SERVICE:-0}"
 	Q_READS="${PLUGIN_READS:-}"
 } 2>/dev/null
 
 # Re-source the write backend so its settings (not the query backend's) are
 # the ones forwarded to the write nodes.
-source "${BENCH_DIR}/backends/${WRITE_BACKEND}/backend.conf"
+source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
 
 # The query backend must be able to read what the write backend produced.
 if [[ -n "${Q_READS}" && " ${Q_READS} " != *" ${WRITE_BACKEND} "* ]]; then
@@ -106,7 +106,7 @@ CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_NODES QUERY_NODE BENCH_DIR RU
 	LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL)
 # Forward each plugin's own settings too, from both backends.
 for _bc in "${WRITE_BACKEND}" "${QUERY_BACKEND}"; do
-	_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"
+	_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/${_bc}_backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"
 	for _v in ${_pv}; do
 		[[ " ${CONFIG_VARS[*]} " == *" ${_v} "* ]] || CONFIG_VARS+=("${_v}")
 	done
@@ -302,7 +302,7 @@ phase_write_serve() {
 	_phase_serve_backend "${WRITE_BACKEND}" "${W_SERVICE}" "serve-write"
 }
 
-phase_serve() {
+phase_query_serve() {
 	# When write and query backends are the same, their service was already
 	# started by serve-write; running serve-start again would be a no-op at
 	# best, so skip it.
@@ -310,7 +310,7 @@ phase_serve() {
 		echo "   write and query backend are both '${QUERY_BACKEND}'; service already started by serve-write"
 		return 0
 	fi
-	_phase_serve_backend "${QUERY_BACKEND}" "${Q_SERVICE}" "serve"
+	_phase_serve_backend "${QUERY_BACKEND}" "${Q_SERVICE}" "serve-query"
 }
 
 phase_check() {
@@ -337,11 +337,16 @@ phase_live() {
 }
 
 phase_stop() {
-	# Stop the query backend's service first (it may depend on the write
-	# backend's data), then the write backend's. When both are the same,
-	# the second call is a no-op because the process is already gone.
-	_phase_stop_backend "${QUERY_BACKEND}" "${Q_SERVICE}" "serve"
-	if [[ "${WRITE_BACKEND}" != "${QUERY_BACKEND}" ]]; then
+	# When both backends are the same, their service was started by
+	# serve-write (prefix "serve-write"), and serve-query was skipped. Stop
+	# with the prefix the service was actually started under so that the
+	# Slurm launcher finds the right srun pid file.
+	if [[ "${WRITE_BACKEND}" == "${QUERY_BACKEND}" ]]; then
+		_phase_stop_backend "${WRITE_BACKEND}" "${W_SERVICE}" "serve-write"
+	else
+		# Stop the query backend's service first (it may depend on the write
+		# backend's data), then the write backend's.
+		_phase_stop_backend "${QUERY_BACKEND}" "${Q_SERVICE}" "serve-query"
 		_phase_stop_backend "${WRITE_BACKEND}" "${W_SERVICE}" "serve-write"
 	fi
 }
@@ -359,7 +364,7 @@ echo "          ${COMPONENTS_PER_NODE} components x ${SAMPLES} samples per serve
 PHASES=()
 for phase in "$@"; do
 	if [[ "$phase" == "all" ]]; then
-		PHASES+=(build serve-write write serve check stop)
+		PHASES+=(build serve-write write serve-query check stop)
 	else
 		PHASES+=("$phase")
 	fi
@@ -371,7 +376,7 @@ for phase in "${PHASES[@]}"; do
 	build) phase_build || FAILED=1 ;;
 	serve-write) phase_write_serve ;;
 	write) phase_write ;;
-	serve) phase_serve ;;
+	serve-query) phase_query_serve ;;
 	check) phase_check ;;
 	live) phase_live ;;
 	stop) phase_stop ;;

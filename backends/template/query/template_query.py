@@ -1,4 +1,5 @@
-"""Template query adapter. Copy to backends/<name>/query.py and fill in.
+"""Template query adapter. Copy this directory to backends/<name>/query/
+and rename this file to <name>_query.py.
 
 See core/adapter.py for the interface and backends/README.md for the rules.
 """
@@ -10,7 +11,7 @@ class TemplateAdapter(Adapter):
     dialect = "template"       # query language; query sets may key on it
 
     def connect(self):
-        # Connect using settings from self.ctx["env"] (backend.conf), then
+        # Connect using settings from self.ctx["env"] (<name>_backend.conf), then
         # confirm that self.ctx["target"] exists and holds self.ctx["schema"]
         # records. Raise BackendError otherwise.
         raise BackendError("template backend: connect() not implemented")

@@ -1,9 +1,9 @@
-# plugin.sh -- DSOS query backend hooks, sourced by bin/node.sh.
+# dsos_plugin.sh -- DSOS query backend hooks, sourced by bin/node.sh.
 #
 # DSOS runs one dsosd per server; a query fans out to all of them and the
 # client merges the results. This plugin provides the service and clean hooks;
 # it has no writer of its own (data is written by the sos backend), and its
-# query adapters are in query.py.
+# query adapters are in query/dsos_query.py.
 #
 # Hooks (see backends/README.md):
 #   plugin_serve_start ID / plugin_serve_run ID / plugin_serve_stop /
@@ -11,7 +11,7 @@
 #   plugin_clean ID                           delete this server's containers
 #
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets, and every
-# setting from bench.conf and backend.conf.
+# setting from bench.conf and dsos_backend.conf.
 
 # RPC program number of the D/SOS service (program SOSDB in sosapi.x).
 SOSDB_PROG=40009862

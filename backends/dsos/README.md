@@ -32,7 +32,7 @@ strings in a query set.
 
 ## Configuration
 
-Settings live in `backends/dsos/backend.conf` (override from the environment):
+Settings live in `backends/dsos/dsos_backend.conf` (override from the environment):
 
 | Setting | Default | Purpose |
 |---|---|---|
