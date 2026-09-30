@@ -1,17 +1,23 @@
-# dsos_plugin.sh -- DSOS query backend hooks, sourced by bin/node.sh.
+# dsos_plugin.sh -- DSOS backend hooks, sourced by bin/node.sh.
 #
 # DSOS runs one dsosd per server; a query fans out to all of them and the
-# client merges the results. This plugin provides the service and clean hooks;
-# it has no writer of its own (data is written by the sos backend), and its
-# query adapters are in query/dsos_query.py.
+# client merges the results. This plugin provides write, service and clean
+# hooks, and its query adapters are in query/dsos_query.py.
+#
+# The DSOS writer connects to the local dsosd through a session file and
+# writes records through the distributed API.  dsosd must be running
+# (serve-write starts it before the write phase).  Containers end up in
+# the same location the SOS writer would use, so DSOS-written data can be
+# queried by either the sos or dsos backend.
 #
 # Hooks (see backends/README.md):
+#   plugin_write WRITER TARGET MODE INDEX ID  write through dsosd
 #   plugin_serve_start ID / plugin_serve_run ID / plugin_serve_stop /
 #   plugin_serve_status                       manage dsosd on this server
-#   plugin_clean ID                           delete this server's containers
+#   plugin_clean ID                           delete containers and run files
 #
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets, and every
-# setting from bench.conf and dsos_backend.conf.
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets,
+# dataset_args (array), and every setting from bench.conf and dsos_backend.conf.
 
 # RPC program number of the D/SOS service (program SOSDB in sosapi.x).
 SOSDB_PROG=40009862
@@ -20,8 +26,50 @@ PIDFILE="${RUN_DIR}/dsosd-${HOST}.pid"
 LOGFILE="${RUN_DIR}/dsosd-${HOST}.log"
 DIRFILE="${RUN_DIR}/dsosd-directory-${HOST}.json"
 
+# This backend's own directory (for the writer and make_schema.py, which
+# are shared with the sos backend).
+DSOS_DIR="${BENCH_DIR}/backends/dsos"
+SOS_DIR="${BENCH_DIR}/backends/sos"
+
 container_path() { # SERVER_ID TARGET
 	echo "${SOS_DATA_ROOT}/$1/$2"
+}
+
+# Session file pointing to the local dsosd, used by the writer.
+write_session_file() {
+	local path="${RUN_DIR}/dsos-write-session-${HOST}.txt"
+	mkdir -p "${RUN_DIR}"
+	echo "${HOST}" >"${path}"
+	echo "${path}"
+}
+
+# ----------------------------------------------------------------- write
+
+plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
+	local writer="$1" target="$2" index="$4" id="$5"
+	local path template session
+	path="$(container_path "$id" "$target")"
+	# Start from an empty container so that reruns do not add duplicates.
+	rm -rf "$path"
+	mkdir -p "$(dirname "$path")" "${RUN_DIR}"
+	# Reuse the sos backend's make_schema.py — the schema is identical.
+	template="${RUN_DIR}/sos-schema-${HOST}.json"
+	"${PYTHON}" "${SOS_DIR}/make_schema.py" "${DATASET}" "$template"
+	# Update the dsosd directory file so it knows about this target.
+	write_directory "$id"
+	session="$(write_session_file)"
+	local args=(--session "$session" --target "$target"
+		--template "$template" --node-index "$index"
+		"${dataset_args[@]}")
+	log "writing ${target} (dsos writer, through dsosd on ${HOST}) to ${path}"
+	case "$writer" in
+	dsos)
+		"${PYTHON}" "${DSOS_DIR}/writer/dsos_write.py" "${args[@]}"
+		;;
+	*)
+		die "the dsos backend has no writer '$writer' (available: dsos)"
+		;;
+	esac
 }
 
 write_directory() { # SERVER_ID
@@ -129,8 +177,15 @@ plugin_serve_status() {
 }
 
 plugin_clean() { # SERVER_ID
-	# Remove dsosd's own run files; the containers belong to the write backend
-	# and are removed by its clean phase.
+	local id="$1"
+	# Remove containers written by the dsos writer (if any).
+	if [[ -d "${SOS_DATA_ROOT}/${id}" ]]; then
+		rm -rf "${SOS_DATA_ROOT:?}/${id}"
+		log "removed ${SOS_DATA_ROOT}/${id}"
+	fi
+	# Remove dsosd run files and session file.
 	rm -f "${PIDFILE}" "${DIRFILE}" "${LOGFILE}"
+	rm -f "${RUN_DIR}/dsos-write-session-${HOST}.txt"
+	rm -f "${RUN_DIR}/sos-schema-${HOST}.json"
 	log "removed dsosd run files on this node"
 }

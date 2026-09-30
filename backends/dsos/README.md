@@ -1,22 +1,27 @@
 # dsos backend
 
-Queries SOS containers across all server nodes at once through the `dsosd` RPC
-service. A single query fans out to every server, each scans its own partition,
-and the client merges the results in index order. This is the distributed query
-path for data written by the `sos` backend.
+Writes to and queries SOS containers across all server nodes through the
+`dsosd` RPC service. A single query fans out to every server, each scans its
+own partition, and the client merges the results in index order.
 
 ## What it supports
 
 | | |
 |---|---|
-| Write | Not yet. The DSOS write API (`dsos_obj_create`) exists and can be added later; for now data is written by the `sos` backend |
+| Write | Yes, through the `dsosd` API (`dsos` writer). Each server's writer connects to the local `dsosd` and inserts records through the distributed API |
 | Query | Yes, across all servers through `dsosd` |
 | Reads data written by | `sos`, `dsos` (declared in `PLUGIN_READS`) |
-| Service | `dsosd` on each server node; started in the `serve` phase (or `serve-write` when `dsos` is the write backend) and stopped in the `stop` phase |
+| Service | `dsosd` on each server node; started in `serve-write` and stopped in `stop` |
 
-Because it has no writer, `dsos` is used as `QUERY_BACKEND` with `sos` as
-`WRITE_BACKEND`. The harness checks the target's metadata so `dsos` only queries
-`sos`-written data.
+The DSOS writer stores data in the same SOS container format as the `sos`
+backend, so data written by either backend can be queried by either.
+
+Common configurations:
+
+| `WRITE_BACKEND` | `QUERY_BACKEND` | Description |
+|---|---|---|
+| `sos` | `dsos` | Write locally, query through dsosd |
+| `dsos` | `dsos` | Write and query through dsosd |
 
 ## Query methods
 
@@ -39,7 +44,7 @@ Settings live in `backends/dsos/dsos_backend.conf` (override from the environmen
 | `DSOSD` | `dsosd` | The `dsosd` command. Set to `sudo -E dsosd` if registering with `rpcbind` needs root |
 | `DSOSQL` | `dsosql` | The `dsosql` command (used by the `dsosql` adapter) |
 | `SOS_ROW_LIMIT` | `4096` | Rows per batch the `dsos` adapter fetches |
-| `SOS_DATA_ROOT` | `/tmp/monbench-<user>/data` | Where each server's containers are; must match the `sos` backend's value so `dsosd` finds them |
+| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}/` | Where each server's containers are; must match the `sos` backend's value so `dsosd` finds them |
 
 ### Choosing the query adapter
 
