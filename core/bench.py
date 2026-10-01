@@ -77,8 +77,11 @@ def load_plugin():
 
 
 def make_adapter(cls, target):
-    return cls({"target": target, "schema": DS.name, "servers": SERVERS,
+    inst = cls({"target": target, "schema": DS.name, "servers": SERVERS,
                 "run_dir": RUN_DIR, "env": os.environ})
+    inst._column_map = _build_column_map(
+        cls.type_overrides, DS.definition.get("attributes", []))
+    return inst
 
 # ----------------------------------------------------------------- row checks
 
@@ -197,7 +200,16 @@ def load_query_set(path, adapter):
     queries = doc.get("queries")
     if not isinstance(queries, list) or not queries:
         sys.exit(f"bench.py: {path} has no 'queries' list")
-    values = DS.placeholders(LIMIT_N)
+    values = DS.placeholders(LIMIT_N,
+                             _build_literal_formats(adapter.type_overrides))
+    # Build the column map once so we can apply it to every query template
+    # *before* placeholder expansion.  This order matters: literal formats
+    # may inject function names that contain a dataset attribute name (e.g.
+    # to_timestamp_seconds), and a post-expansion string replace would
+    # mangle them.  Applying the map to the raw template — where only
+    # column references use the dataset name — avoids this entirely.
+    col_map = _build_column_map(
+        adapter.type_overrides, DS.definition.get("attributes", []))
     out = []
     for n, q in enumerate(queries):
         where = f"query {n + 1} ('{q.get('name', '')}') in {path}"
@@ -206,6 +218,9 @@ def load_query_set(path, adapter):
             text = text.get(adapter.name, text.get(adapter.dialect))
         if text is None and "query" not in q:
             sys.exit(f"bench.py: {where} has no 'query'")
+        # Rename columns before expanding placeholders.
+        if text:
+            text = _apply_column_map(text, col_map)
         match = q.get("match")
         spec, reason = (parse_match(fill(match, values, where)) if match
                         else (None, "no 'match' description"))
@@ -316,14 +331,62 @@ class Report:
         return any(i["status"] == "FAIL" for i in self.items)
 
 
+def _build_column_map(type_overrides, attributes):
+    """Build {dataset_name: backend_name} from type_overrides and dataset attributes."""
+    if not type_overrides:
+        return None
+    col_map = {}
+    for attr in attributes:
+        override = type_overrides.get(attr["type"])
+        if override and "column" in override:
+            col_map[attr["name"]] = override["column"]
+    return col_map or None
+
+
+def _build_literal_formats(type_overrides):
+    """Extract {attr_type: format_string} from type_overrides."""
+    if not type_overrides:
+        return None
+    fmts = {}
+    for attr_type, override in type_overrides.items():
+        if "literal" in override:
+            fmts[attr_type] = override["literal"]
+    return fmts or None
+
+
+def _apply_column_map(text, column_map):
+    """Rewrite dataset attribute names in *text* to backend column names."""
+    if not column_map:
+        return text
+    for dataset_name, backend_name in column_map.items():
+        text = text.replace(dataset_name, backend_name)
+    return text
+
+
+def _reverse_column_map(columns, rows, column_map):
+    """Rename backend column names back to dataset attribute names."""
+    if not column_map:
+        return columns, rows
+    rev = {v: k for k, v in column_map.items()}
+    columns = [rev.get(c, c) for c in columns]
+    rows = [{rev.get(k, k): v for k, v in r.items()} for r in rows]
+    return columns, rows
+
+
 def collect(adapter, text):
-    """Run a query and return (columns, rows) for the whole result."""
+    """Run a query and return (columns, rows) for the whole result.
+
+    The caller is responsible for applying the column map to *text*
+    before calling this function.  Result columns are renamed back to
+    dataset attribute names here so the verifier always sees dataset
+    names.
+    """
     columns, rows = [], []
     for batch in adapter.query(text):
         cols, recs = adapter.records(batch)
         columns = columns or cols
         rows.extend(recs)
-    return columns, rows
+    return _reverse_column_map(columns, rows, adapter._column_map)
 
 
 def timed_run(adapter, text):
@@ -354,13 +417,17 @@ def run_query_set(rep, adapter, queries, mode="both"):
             rep.add(label, "SKIP", f"no query string for adapter '{adapter.name}'")
             continue
 
+        # Column names and literal formats were already applied in
+        # load_query_set, so the query is ready to send as-is.
+        native_query = q["query"]
+
         status, detail = "INFO", ""
         nrows = 0
 
         # 1. Untimed verification run (check and both modes).
         if do_check:
             try:
-                columns, rows = collect(adapter, q["query"])
+                columns, rows = collect(adapter, native_query)
             except Exception as e:
                 rep.add(label, "FAIL", f"{type(e).__name__}: {e}", query=q["query"])
                 continue
@@ -383,7 +450,7 @@ def run_query_set(rep, adapter, queries, mode="both"):
         times = []
         try:
             for i in range(REPEAT):
-                t, n = timed_run(adapter, q["query"])
+                t, n = timed_run(adapter, native_query)
                 times.append(t)
                 if nrows == 0 and i == 0:
                     nrows = n       # first timed run establishes the baseline in query-only mode
@@ -525,6 +592,7 @@ def run_live(target):
                  if q["type"] == "all" and q["query"]), None)
     if not text:
         sys.exit(f"bench.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
+    # Column names and literal formats were already applied in load_query_set.
     print(f"Polling '{target}' every {LIVE_POLL}s until {final} rows")
     counts, invalid, errors = [], 0, 0
     deadline = time.monotonic() + 600

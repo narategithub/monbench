@@ -21,6 +21,18 @@ class Adapter:
     #: Query language. Query sets may give one string per dialect, so
     #: adapters that share a language share query strings.
     dialect = None
+    #: Map dataset attribute *types* to backend-specific overrides.
+    #: Keys are type names from the dataset definition (e.g. "timestamp",
+    #: "uint64", "string").  Each value is a dict with optional keys:
+    #:   "column"  — the backend's column name for attributes of this type
+    #:              (e.g. InfluxDB always stores the timestamp as ``time``)
+    #:   "literal" — a format string applied to placeholder values of this
+    #:              type (e.g. ``"to_timestamp({})"`` for InfluxDB timestamps)
+    #: The engine resolves which attributes are affected using the dataset
+    #: definition, so query strings and the verifier always use dataset
+    #: names and bare values; each backend only declares its conventions
+    #: by type.
+    type_overrides = None
 
     def __init__(self, ctx):
         """ctx: dict with

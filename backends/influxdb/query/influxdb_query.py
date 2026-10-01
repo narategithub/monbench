@@ -85,7 +85,9 @@ class InfluxHttpAdapter(Adapter):
 
     name = "influxdb-http"
     dialect = None
-    column_map = {"timestamp": "time"}
+    type_overrides = {
+        "timestamp": {"column": "time", "literal": "to_timestamp_seconds({})"},
+    }
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -128,13 +130,15 @@ class InfluxHttpAdapter(Adapter):
             raise
         except Exception as e:
             raise BackendError(f"probe query failed: {e}")
-        if rows[0]["n"] == 0:
+        if not rows or rows[0]["n"] == 0:
             raise BackendError(
                 f"measurement '{self.ctx['schema']}' not found or empty in "
                 f"database '{self.database}' at {self.host}")
 
     def query(self, text):
         rows = self._request(text)
+        if rows:
+            self._columns = list(rows[0].keys())
         yield rows
 
     @staticmethod
@@ -153,7 +157,9 @@ class InfluxPythonAdapter(Adapter):
 
     name = "influxdb"
     dialect = None
-    column_map = {"timestamp": "time"}
+    type_overrides = {
+        "timestamp": {"column": "time", "literal": "to_timestamp_seconds({})"},
+    }
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -187,7 +193,7 @@ class InfluxPythonAdapter(Adapter):
         except Exception as e:
             raise BackendError(
                 f"probe query for '{self.ctx['schema']}' failed: {e}")
-        if table["n"][0] == 0:
+        if table is None or table["n"][0] == 0:
             raise BackendError(
                 f"measurement '{self.ctx['schema']}' not found or empty in "
                 f"database '{self.database}' at {self.host}")

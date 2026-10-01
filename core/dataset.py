@@ -112,10 +112,21 @@ class Dataset:
                                           v["mem_free"], v["load"]))
         return self._records
 
-    def placeholders(self, limit):
-        """Values available to query sets as {name}."""
+    def placeholders(self, limit, literal_formats=None):
+        """Values available to query sets as {name}.
+
+        *literal_formats* is an optional dict mapping dataset attribute
+        types to format strings (e.g. ``{"timestamp": "to_timestamp({})"}``).
+        When provided, placeholder values of that type are wrapped
+        accordingly so the generated SQL uses the backend's native literal
+        syntax.
+        """
+        def fmt(val, attr_type):
+            if literal_formats and attr_type in literal_formats:
+                return literal_formats[attr_type].format(val)
+            return val
         def ts(seq):
-            return self.t0 + seq * self.interval
+            return fmt(self.t0 + seq * self.interval, "timestamp")
         s, c, last = self.samples, self.components_per_partition, self.partitions
         mid = s // 2
         return {
@@ -124,10 +135,13 @@ class Dataset:
             "t_start": ts(0), "t_end": ts(s - 1),
             "t_q1": ts(s // 4), "t_mid": ts(mid), "t_q3": ts(3 * s // 4),
             "t_mid_1pct": ts(mid + max(1, s // 100)),
-            "comp_s0": 1000, "comp_s0_last": 1000 + c - 1,
-            "comp_slast": last * 1000, "comp_last": last * 1000 + c - 1,
-            "job_first": 1, "job_mid": 1 + mid // self.job_len,
-            "job_last": 1 + (s - 1) // self.job_len,
+            "comp_s0": fmt(1000, "uint64"),
+            "comp_s0_last": fmt(1000 + c - 1, "uint64"),
+            "comp_slast": fmt(last * 1000, "uint64"),
+            "comp_last": fmt(last * 1000 + c - 1, "uint64"),
+            "job_first": fmt(1, "uint64"),
+            "job_mid": fmt(1 + mid // self.job_len, "uint64"),
+            "job_last": fmt(1 + (s - 1) // self.job_len, "uint64"),
         }
 
 # ---------------------------------------------------------------- metadata
