@@ -1,19 +1,19 @@
 # Limitations and roadmap
 
-This document tracks what the current version does not do, what we plan to do
-about it, and why. Update it whenever an item is decided, deferred, or done.
+This document tracks what the current version does not do, what we may do
+about it, and why. Update it whenever an item is completed or revisited.
 Operational notes for running the current version (such as permissions and
 output formats) are in `README.md`, "Assumptions and limits".
 
 **Status legend**
 
-- **Decided** — agreed; to be done in the next version.
-- **Proposed** — recommended; awaiting a decision.
-- **Deferred** — agreed to postpone, to stabilise the first version.
+- **Suggested improvement** — a known limitation with a concrete path
+  forward; not yet scheduled.
+- **Deferred** — agreed to postpone, to stabilise this version.
 - **Out of scope** — deliberately not covered by the suite.
 - **Done** — completed; kept for the record of why.
 
-Last updated: 2026-09-28
+Last updated: 2026-10-01
 
 ---
 
@@ -26,7 +26,7 @@ Last updated: 2026-09-28
   * Options:
     * Compute each query's expected answer as one `seq` range per component. Every supported condition narrows the components or a `seq` range, so cost grows with the number of components, not records.
     * For very large results, verify the exact row count plus a sample of rows instead of every row.
-  * Decision: **Proposed.** About half a day. Best done before other backends depend on the current verifier.
+  * Status: **Suggested improvement.** About half a day. Best done before other backends depend on the current verifier.
 
 * **Driver starts one `ssh` or `srun` per server**
   * Current limitation:
@@ -34,15 +34,15 @@ Last updated: 2026-09-28
   * Options:
     * Slurm: one `srun` across all servers; each task finds its partition index from its host name.
     * ssh: cap the number of connections started at once (for example 64).
-  * Decision: **Proposed.** A few hours.
+  * Status: **Suggested improvement.** A few hours.
 
 * **Backend service starts one server at a time**
   * Current limitation:
-    * `serve` starts the service on each server in turn and waits for each to be ready.
+    * `serve-write` and `serve-query` start the service on each server in turn and wait for each to be ready.
     * Takes a long time with many servers.
   * Options:
     * Start all servers in parallel and wait for all, as the write phase already does.
-  * Decision: **Proposed.** About an hour.
+  * Status: **Suggested improvement.** About an hour.
 
 * **One writer process per server**
   * Current limitation:
@@ -50,14 +50,14 @@ Last updated: 2026-09-28
     * Different writers (C, Python) run one after another. This is intentional, so their timings do not interfere.
   * Options:
     * Several writer processes per server, each writing part of the partition.
-  * Decision: **Deferred.** Not needed for query benchmarking; revisit for ingest benchmarking.
+  * Status: **Deferred.** Not needed for query benchmarking; revisit for ingest benchmarking.
 
 * **Scale not yet demonstrated**
   * Current limitation:
     * Tested on 2–3 nodes and up to 160,000 records. The node count itself is unrestricted (`SERVER_NODES`).
   * Options:
-    * Run on a large cluster once the three proposed scale items are done.
-  * Decision: **Deferred** until the scale items above are addressed.
+    * Run on a large cluster once the scale items above are addressed.
+  * Status: **Deferred** until the scale items above are addressed.
 
 ---
 
@@ -65,11 +65,11 @@ Last updated: 2026-09-28
 
 * **Timings include building DataFrames**
   * Current limitation:
-    * The `dsos` adapter uses the Python API, which returns DataFrames; conversion time is included.
+    * The `dsos` and `sos` adapters use the Python API, which returns DataFrames; conversion time is included.
     * Represents an analyst's experience, not the fastest a client could achieve.
   * Options:
     * A C query client for DSOS (and native clients for other backends) as an "engine tier".
-  * Decision: **Deferred.** Python is used for all backends in the first version, which keeps the comparison even.
+  * Status: **Deferred.** Python is used for all backends in this version, which keeps the comparison even.
 
 * **One client at a time**
   * Current limitation:
@@ -77,29 +77,29 @@ Last updated: 2026-09-28
   * Options:
     * Closed loop: N clients each sending the next query when the previous finishes (throughput).
     * Open loop: queries arrive at a set rate (latency under load).
-  * Decision: **Deferred** to the version that adds use-case workloads.
+  * Status: **Deferred** to the version that adds use-case workloads.
 
 * **Few repetitions per query**
   * Current limitation:
     * Default `REPEAT=5`; the reported p95 is effectively the maximum.
   * Options:
     * Raise the default; report p95 only when enough runs exist.
-  * Decision: **Proposed.** Small change.
+  * Status: **Suggested improvement.** Small change.
 
 * **No control of cache state**
   * Current limitation:
-    * All timed runs follow an untimed run, so they measure warm-cache performance only.
+    * In `both` mode, timed runs follow an untimed verification run, so they measure warm-cache performance. In `query` mode, all runs are timed; the first may include cold-cache effects.
     * Dropping the page cache in Docker affects the whole host.
   * Options:
     * Optional cold-cache runs on bare metal (drop caches before each run).
-  * Decision: **Deferred.**
+  * Status: **Deferred.**
 
 * **No server resource monitoring**
   * Current limitation:
-    * CPU, memory and disk use on the servers during queries are not recorded.
+    * CPU, memory and disk use on the servers during the benchmark are not recorded.
   * Options:
-    * Sample `/proc` on each server during the check phase.
-  * Decision: **Deferred.**
+    * Sample `/proc` on each server during the check and query phases.
+  * Status: **Deferred.**
 
 ---
 
@@ -112,14 +112,14 @@ Last updated: 2026-09-28
   * Options:
     * A workload file with query strings, frequencies and scale, from configuration.
     * A converter from a site's query log into such a file.
-  * Decision: **Deferred** to version 2. The query set is already read from a file, so use-case files can be added as another workload source.
+  * Status: **Deferred** to version 2. The query set is already read from a file, so use-case files can be added as another workload source.
 
 * **Query strings are written per backend**
   * Current limitation:
     * Each question needs a query string for each backend's language.
   * Options:
     * Generate backend strings from the neutral `match` description.
-  * Decision: **Deferred.** Manual strings are enough for two backends.
+  * Status: **Deferred.** Manual strings are enough for the current backends.
 
 * **Verifier understands only simple conditions**
   * Current limitation:
@@ -127,7 +127,7 @@ Last updated: 2026-09-28
     * No `or`, no aggregates, no grouping; such queries run unverified (INFO).
   * Options:
     * Extend the condition grammar; add expected results for aggregates.
-  * Decision: **Deferred.**
+  * Status: **Deferred.**
 
 * **No aggregation, downsampling or derivative queries**
   * Current limitation:
@@ -137,7 +137,7 @@ Last updated: 2026-09-28
   * Options:
     * Add these families once the syntax is confirmed from the DSOS query parser source.
     * Define each by its result; count client-side work in the backend's time.
-  * Decision: **Deferred.**
+  * Status: **Deferred.**
 
 ---
 
@@ -149,7 +149,7 @@ Last updated: 2026-09-28
     * `dataset/default.json` lists attributes and keys, but the value rules are code in `core/dataset.py` and the writers.
   * Options:
     * Additional shapes (wide, narrow, other entity models), each with its own value rules.
-  * Decision: **Deferred.**
+  * Status: **Deferred.**
 
 * **No support for existing data from other sources**
   * Current limitation:
@@ -157,33 +157,36 @@ Last updated: 2026-09-28
     * Data written by earlier versions of the suite has no metadata; the engine falls back to current settings.
   * Options:
     * A hand-written metadata template for existing databases; verification off for such data.
-  * Decision: **Deferred.**
+  * Status: **Deferred.**
 
 ---
 
 ## Backends
 
-* **Backends: sos (write), dsos (query), influxdb (write+query) planned**
+* **Backend status**
   * Current state:
-    * `sos` writes local SOS containers (C and Python writers); no query adapter yet.
-    * `dsos` queries SOS containers across servers through dsosd; no writer yet.
-    * A run picks a write backend and a query backend (`WRITE_BACKEND`, `QUERY_BACKEND`); the primary case is write with `sos`, query with `dsos`.
-    * `influxdb` (v3) is not yet implemented.
+    * `sos` writes local SOS containers (C and Python writers) and can query
+      them directly on disk (Python adapter).
+    * `dsos` writes through `dsosd` (Python writer) and queries through `dsosd`
+      (Python API and `dsosql`).
+    * `influxdb` writes and queries InfluxDB v3 Core (Python client and HTTP).
+    * A run picks a write backend and a query backend; tested pairs are
+      sos→dsos, sos→sos, dsos→dsos, and influxdb→influxdb.
   * Options / next:
-    * InfluxDB v3 plugin: write and query, with `INFLUX_INTERFACE` (python/http) and `INFLUX_QUERY_LANG` (sql/influxql).
-    * `dsos` writer: the DSOS Python API can write (`DsosContainer.insert_df`, object-based, not SQL); add it so DSOS write can be benchmarked too.
-    * `sos` query adapter: query one node's container directly, for a single-node comparison point.
     * Elasticsearch: distributes queries across shards, closer to DSOS in design.
-  * Decision: **Decided:** InfluxDB v3 is the next backend. `dsos` writer and `sos` query are **Deferred** (sos covers writing, dsos covers querying for now).
+  * Status: Elasticsearch is a **suggested improvement.**
 
 * **Unequal topologies between backends**
   * Current limitation:
     * DSOS spreads data and each query over several servers.
     * Open-source InfluxDB 3 Core is single-node; clustering needs the commercial Enterprise edition, and adds query throughput rather than per-query speed.
+    * The `sos` direct query adapter provides a single-node comparison point
+      for SOS/DSOS, but the topologies still differ when comparing against
+      InfluxDB.
   * Options:
     * Also run DSOS on one server, for a like-for-like comparison and a scaling curve.
     * Report topology and total resources with every result.
-  * Decision: **Proposed.**
+  * Status: **Suggested improvement.**
 
 * **Different result semantics between backends**
   * Current limitation:
@@ -191,7 +194,17 @@ Last updated: 2026-09-28
     * DSOS returns partial groups per server.
   * Options:
     * Define each question's result exactly; adapters or the client combine partial results, and that time counts.
-  * Decision: **Deferred** to when aggregate queries are added.
+  * Status: **Deferred** to when aggregate queries are added.
+
+* **No multi-config run**
+  * Current limitation:
+    * Running several writer→query pairs (sos→dsos, dsos→dsos,
+      influxdb→influxdb) requires separate `bin/run.sh -c <conf>` invocations.
+  * Options:
+    * A wrapper script or a `CONFIGS` list in a top-level config that runs
+      each pair in sequence and collects the results.
+    * A combined report comparing results across pairs.
+  * Status: **Suggested improvement.**
 
 ---
 
@@ -202,7 +215,7 @@ Last updated: 2026-09-28
     * The `live` test checks correctness while data is written; it is not a benchmark.
   * Options:
     * A mixed read/write benchmark with concurrent writers and query clients.
-  * Decision: **Out of scope** for the first version; too much work for its value now.
+  * Status: **Out of scope** for this version; too much work for its value now.
 
 ---
 
@@ -216,7 +229,7 @@ Last updated: 2026-09-28
   * Note:
     * Name checks: not on PyPI. On GitHub, `Wilfred2002/MonBench` is a personal repository in an unrelated field (a Monad blockchain app template, no description or stars). GitHub names are per owner, so it does not block `ovis-hpc/monbench`.
     * Similar names exist: `benchmon` (an HPC resource monitor from the SKA project) and `moonbench` (a MoonBit benchmarking toolkit).
-  * Decision: **Done** in this version.
+  * Status: **Done** in this version.
 
 ---
 
