@@ -26,8 +26,10 @@ _INFLUX_LOG="${RUN_DIR}/influxdb3.log"
 
 plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	log "token file: ${INFLUX_TOKEN_FILE}"
-	log "token: $(_influx_read_token)"
-	local writer="$1" target="$2" index="$4"
+	local writer="$1" index="$4"
+	# $2 (target) is part of the plugin_write contract but unused here: the
+	# measurement name is DATA_NAME, not the per-writer target string, so
+	# every backend's query strings can address it with {schema} uniformly.
 	[[ "$writer" == "influx" ]] ||
 		die "the influxdb backend has no writer '$writer' (available: influx)"
 
@@ -44,9 +46,9 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	local token
 	token="$(_influx_read_token)"
 
-	log "writing ${target} (influx writer, ${INFLUX_INTERFACE} interface) to ${INFLUX_HOST}"
+	log "writing ${DATA_NAME} to ${INFLUX_DATABASE} (influx writer, ${INFLUX_INTERFACE} interface) on ${INFLUX_HOST}"
 	"${PYTHON}" "${INFLUX_DIR}/writer/influx_write.py" \
-		--measurement "$target" --node-index "$index" \
+		--measurement "$DATA_NAME" --node-index "$index" \
 		"${args[@]}" --batch "${INFLUX_WRITE_BATCH}" \
 		--interface "${INFLUX_INTERFACE}" \
 		--host "${INFLUX_HOST}" \
@@ -76,12 +78,18 @@ plugin_serve_start() { # SERVER_ID
 
 	# Generate an admin token offline so we have it before the server starts.
 	# --offline writes a JSON file; the server is then started with that file
-	# so auth is active from the first request.
+	# so auth is active from the first request. The CLI also prints the
+	# token to its own stdout (even with --output-file given); redirect that
+	# to the influxdb3 log instead of letting it reach the terminal, and
+	# fall back to the token file if a reader needs it for debugging.
 	log "generating admin token"
 	influxdb3 create token --admin \
 		--offline \
 		--name "monbench-admin" \
-		--output-file "${INFLUX_TOKEN_FILE}"
+		--output-file "${INFLUX_TOKEN_FILE}" \
+		>>"${_INFLUX_LOG}" 2>&1 \
+		|| die "token generation failed; see ${_INFLUX_LOG}" \
+		>/dev/null
 
 	log "starting influxdb3 (data: ${INFLUX_DATA_DIR})"
 	influxdb3 serve \

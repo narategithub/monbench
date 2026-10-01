@@ -85,6 +85,7 @@ class InfluxHttpAdapter(Adapter):
 
     name = "influxdb-http"
     dialect = None
+    column_map = {"timestamp": "time"}
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -94,7 +95,6 @@ class InfluxHttpAdapter(Adapter):
         self.lang = _lang(env)
         self.dialect = self.lang
         self._token = None
-        self._columns = []
 
     def _request(self, query):
         url = (f"{self.host}/api/v3/query_sql" if self.lang == "sql"
@@ -121,22 +121,20 @@ class InfluxHttpAdapter(Adapter):
     def connect(self):
         self._token = _read_token(self.ctx["env"])
         probe = (_PROBE_SQL if self.lang == "sql" else _PROBE_INFLUXQL).format(
-            measurement=self.ctx["target"])
+            measurement=self.ctx["schema"])
         try:
             rows = self._request(probe)
         except BackendError:
             raise
         except Exception as e:
             raise BackendError(f"probe query failed: {e}")
-        if not rows:
+        if rows[0]["n"] == 0:
             raise BackendError(
-                f"measurement '{self.ctx['target']}' not found or empty in "
+                f"measurement '{self.ctx['schema']}' not found or empty in "
                 f"database '{self.database}' at {self.host}")
 
     def query(self, text):
         rows = self._request(text)
-        if rows:
-            self._columns = list(rows[0].keys())
         yield rows
 
     @staticmethod
@@ -144,7 +142,7 @@ class InfluxHttpAdapter(Adapter):
         return len(batch)
 
     def records(self, batch):
-        cols = self._columns or (list(batch[0].keys()) if batch else [])
+        cols = list(batch[0].keys()) if batch else []
         return cols, [_row_to_dict(r) for r in batch]
 
 
@@ -155,6 +153,7 @@ class InfluxPythonAdapter(Adapter):
 
     name = "influxdb"
     dialect = None
+    column_map = {"timestamp": "time"}
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -182,15 +181,15 @@ class InfluxPythonAdapter(Adapter):
                 f"cannot create InfluxDB client for {self.host}: {e}")
 
         probe = (_PROBE_SQL if self.lang == "sql" else _PROBE_INFLUXQL).format(
-            measurement=self.ctx["target"])
+            measurement=self.ctx["schema"])
         try:
             table = self._client.query(query=probe, language=self.lang, mode="pandas")
         except Exception as e:
             raise BackendError(
-                f"probe query for '{self.ctx['target']}' failed: {e}")
-        if table is None or len(table) == 0:
+                f"probe query for '{self.ctx['schema']}' failed: {e}")
+        if table["n"][0] == 0:
             raise BackendError(
-                f"measurement '{self.ctx['target']}' not found or empty in "
+                f"measurement '{self.ctx['schema']}' not found or empty in "
                 f"database '{self.database}' at {self.host}")
 
     def query(self, text):

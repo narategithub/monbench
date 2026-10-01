@@ -3,9 +3,9 @@
 InfluxDB 3 server.
 
 Produces the data set defined in core/dataset.py, the same records the SOS
-writers produce, so the query engine verifies InfluxDB answers against the
-same expected values. The measurement (table) is the data set name; the key
-attributes component_id and job_id become tags; the remaining attributes
+writers produce, so the query engine verifies InfluxDB answers against the same
+expected values. The measurement (table) name is passed via --measurement; the
+key attributes component_id and job_id become tags; the remaining attributes
 become fields; seq is kept as a field so rows can be identified in
 verification.
 
