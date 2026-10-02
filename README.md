@@ -7,8 +7,8 @@ monbench writes a deterministic monitoring-style data set into a database
 backend, then runs a set of queries against it from a separate query node,
 verifying every answer and timing every query. The core of the suite knows
 nothing about any particular database: each backend is a plugin under
-`backends/`. The first plugin is SOS/DSOS; `backends/template/` is the
-starting point for others.
+`backends/`. The first plugins are SOS/DSOS and InfluxDB; `backends/template/`
+is the starting point for others.
 
 ```
   server node 1           server node 2           ...      query node
@@ -21,7 +21,7 @@ starting point for others.
 
 | Path | Purpose |
 |---|---|
-| `bench.conf` | Core settings: backend, nodes, paths, data-set size, query settings |
+| `bench.conf.example` | Template for `bench.conf`: backend, nodes, paths, data-set size, query settings |
 | `bin/run.sh` | Driver: runs each phase on the right nodes via ssh, Slurm or by hand |
 | `bin/node.sh` | Actions executed on a single node; calls the backend's hooks |
 | `core/dataset.py` | The data set: value rules, parameters, metadata files |
@@ -29,20 +29,34 @@ starting point for others.
 | `core/adapter.py` | The interface query adapters implement |
 | `dataset/default.json` | Data set definition: attributes and keys |
 | `queries/default.json` | Default query set, used when `QUERY_FILE` is empty |
-| `backends/README.md` | How to write a backend plugin |
-| `backends/sos/` | SOS/DSOS plugin: settings, hooks, C and Python writers, query adapters, RPC test tool |
+| `EXTENDING.md` | How to add a backend, define a dataset, or write a query file |
+| `backends/README.md` | Summary of backends provided and their capabilities |
+| `backends/sos/` | SOS backend: local containers, C and Python writers, direct query adapter |
+| `backends/dsos/` | DSOS backend: distributed query through `dsosd`, DSOS writer, `dsosql` adapter |
+| `backends/influxdb/` | InfluxDB v3 backend: writer, Python and HTTP query adapters |
 | `backends/template/` | Skeleton for a new backend |
 | `slurm/monbench.sbatch` | Batch script for a Slurm job |
 | `ROADMAP.md` | Current limitations, and what is planned or deferred, with the reasons |
 | `OUTPUT.md` | Result file structure, JSON schema, and timing measurement boundaries |
 
-## Choosing a backend
+## Write and query backends
 
-Set `BACKEND` in `bench.conf` to the name of a directory under `backends/`.
-That backend's `<name>_backend.conf` holds its own settings (for SOS: installation
-prefix, container location, storage type, `dsosd` command). The run stops
-with an error if the backend does not exist, if its data was written for a
-different backend, or if the query adapter cannot reach it.
+The suite separates writing from querying. `WRITE_BACKEND` names the backend
+that writes the data; `QUERY_BACKEND` names the one that queries it. They are
+often the same, but there are use cases that the ingress and egress backend are
+different. For example, writes with `sos` (local SOS containers) and queries
+with `dsos` (distributed queries through `dsosd`). Tested pairs:
+
+| `WRITE_BACKEND` | `QUERY_BACKEND` | Description |
+|---|---|---|
+| `sos` | `dsos` | Write locally, query through dsosd |
+| `sos` | `sos` | Write and query locally — single-node or shared-filesystem comparison |
+| `dsos` | `dsos` | Write and query through dsosd |
+| `influxdb` | `influxdb` | Write and query InfluxDB v3 |
+
+Set both in `bench.conf`. The run stops with an error if a backend does not
+exist, if its data was written for a different backend, or if the query
+adapter cannot reach it.
 
 ## Requirements
 
@@ -53,20 +67,18 @@ For every backend:
 - The suite directory at the same path on all nodes. On a shared filesystem
   nothing needs copying; otherwise use `bin/run.sh -l ssh deploy`.
 
-For the `sos` backend:
-
-- SOS installed on all nodes: `libsos`, the Python `sosdb` module (with the
-  fix to `SqlQuery.next()`), `dsosd` and `dsosql`.
-- `rpcbind` running on the server nodes, and the query node able to reach the
-  servers' portmapper (TCP/UDP 111) and the port `dsosd` registers.
-- `jansson` and `libuuid` development files on the server nodes (C writer).
+Each backend has additional requirements described in its own README under
+`backends/<n>/README.md`.
 
 ## The data set
 
 The data set is split into one partition per server. Each server writes
 `COMPONENTS_PER_NODE × SAMPLES` records (80,000 by default). Every record is
-a function of its `component_id` and `seq`, so any row can be verified on its
-own. The rules are defined in `core/dataset.py`:
+a function of its `component_id` and `seq` (the sample number, 0 through
+`SAMPLES − 1`), so any row can be verified on its own. `seq` is stored as
+an attribute alongside the computed values; it has no physical meaning
+outside the benchmark but is what makes every row uniquely identifiable for
+verification. The value rules are defined in `core/dataset.py`:
 
 | Attribute | Value |
 |---|---|
@@ -89,110 +101,157 @@ records its backend, writer and data-set parameters in
 parameters, so a later change to `SAMPLES` does not invalidate a check of
 data written earlier.
 
-## Quick start
+The default data set is a fixed monitoring shape. To define a different
+shape, see the "Defining a custom dataset" section in `EXTENDING.md`.
 
-1. Edit `bench.conf`: at minimum `BACKEND`, `SERVER_NODES`, `QUERY_NODE` and,
-   if the backend's software is not on the default paths, `ENV_SETUP`.
-2. Edit `backends/<BACKEND>/<BACKEND>_backend.conf` for that backend (for SOS,
-   `SOS_PREFIX`).
-3. Run one of the following.
+## How monbench works
 
-**ssh** (from any node that can ssh to the other nodes without a password):
+A run is a sequence of **phases**. Each phase does one thing — build
+writers, start a service, write data, verify queries, time queries, or clean
+up. `bin/run.sh` drives the phases, running each step on the right node
+through one of three **launchers**: `ssh`, `slurm`, or `manual`.
+
+### Phases
+
+| Phase | What it does | Where it runs |
+|---|---|---|
+| `deploy` | Copy the suite directory to every node (ssh only; unnecessary on a shared filesystem) | from the driver node |
+| `build` | Compile the backend's writers, if any need compiling | each server node |
+| `serve-write` | Start the write backend's service on the servers, if it has one (`PLUGIN_SERVICE=1`). Skipped when the backend needs no service | each server node |
+| `write` | Write the data set: each server writes its own partition, once per writer in `WRITERS`. After all servers finish a target, the harness records a metadata file | each server node (parallel) |
+| `serve-query` | Start the query backend's service, if it differs from the write backend. Skipped when they are the same or the query backend needs no service | each server node |
+| `check` | Run each query once, untimed, and verify the full result against the data set. No timing is recorded | query node |
+| `query` | Run each query `REPEAT` times and time each run. No verification is performed. Reports median, p95 and minimum | query node |
+| `live` | Write a target at a controlled rate while the query node polls it, checking that every answer is valid and the row count never decreases | servers + query node |
+| `stop` | Stop both backend services | each server node |
+| `clean` | Stop both services and delete the servers' data and run files | each server node |
+
+Two shorthand phases expand into a sequence:
+
+| Shorthand | Expands to |
+|---|---|
+| `all` | `build serve-write write serve-query check query stop` |
+| `all-nocheck` | `build serve-write write serve-query query stop` |
+
+Phases can be given in any combination on the command line. This is useful
+for iterating: start the service once, then run `check` or `query`
+repeatedly while adjusting queries or settings, and `stop` when done:
 
 ```bash
-bin/run.sh -l ssh deploy          # only if the directory is not shared
-bin/run.sh -l ssh all             # build serve-write write serve-query check query stop
+bin/run.sh -l ssh serve-write         # start the write backend's service
+bin/run.sh -l ssh write               # write the data set
+bin/run.sh -l ssh serve-query         # start the query backend's service
+
+bin/run.sh -l ssh check               # verify — run as many times as needed
+bin/run.sh -l ssh query               # time — run as many times as needed
+
+bin/run.sh -l ssh stop                # stop both services when done
 ```
 
-**Slurm** (inside an allocation of at least three nodes; the first two
-become servers and the third the query node):
+### Launchers
 
-```bash
-sbatch slurm/monbench.sbatch
-# or interactively:
-salloc -N 3
-bin/run.sh -l slurm all
-```
+| Launcher | How it runs steps | When to use |
+|---|---|---|
+| `ssh` | ssh to each node (default) | Any environment with passwordless ssh between nodes |
+| `slurm` | `srun` inside a Slurm allocation (`salloc` or `sbatch`) | HPC clusters with Slurm |
+| `manual` | Prints each command with the node to run it on, then waits for you to press Enter | Debugging, or environments without ssh or Slurm |
 
-**Manual** (prints each command with the node to run it on, then waits):
+Select with `-l`: `bin/run.sh -l slurm all`.
 
-```bash
-bin/run.sh -l manual all
-```
+When the Slurm launcher is used and `SERVER_NODES` is not set in `bench.conf`
+or the environment, the harness fills it from the allocation: all nodes
+except the last become servers; the last becomes the query node. Override
+`SERVER_NODES` and `QUERY_NODE` to control the split.
 
 In manual mode, change settings in the configuration files rather than in
 the shell environment, because the commands you type on the other nodes read
 only the files.
 
-Phases can also be run individually, for example to keep the backend's
-service running between checks:
+### Verification
 
-```bash
-bin/run.sh serve-write   # start the write backend's service, if it has one
-bin/run.sh write
-bin/run.sh serve-query   # start the query backend's service
-bin/run.sh check         # verify query results (no timing)
-bin/run.sh query         # time the query set (no verification)
-bin/run.sh live          # concurrent write-and-query test
-bin/run.sh stop          # stop both services
-bin/run.sh clean         # stop the services and delete the data
-```
+The `check` phase runs each query through the backend's query adapter and
+compares the result against the records the question should return, computed
+from the data-set value rules. A query passes when:
 
-Settings can be overridden per run, e.g. `SAMPLES=500 WRITERS=c bin/run.sh all`
-(ssh and Slurm launchers only).
-
-## What the check phase does
-
-`check` runs a **query set** against each target, through a query adapter
-from the backend plugin, and reports a verdict and timings for every query.
-For each query the engine:
-
-1. **runs it once, untimed, and verifies the full result** against the
-   records the question should return, computed from the data set;
-2. **runs it `REPEAT` more times and times each run** from the start of the
-   query until its last row has been fetched. It reports the median and p95.
-
-The connection to the backend is made once, before any query, so timings do
-not include connecting. It is also where the backend is checked: if the
-backend cannot be reached, the target does not exist, or it holds no
-records, the run stops with an error.
-
-`QUERY_ADAPTER` selects the adapter within the backend; empty selects the
-backend's default. The `sos` plugin provides:
-
-| `QUERY_ADAPTER` | Adapter | Use |
-|---|---|---|
-| `dsos` (default) | DSOS Python API (`sosdb`), returning DataFrames | Timings |
-| `dsosql` | The `dsosql` command, parsing its CSV output | Cross-checking results; its timings include process start-up and connecting |
-
-A verified query passes when:
-
-- the row count is right. With `limit`, a count matching either whole-result
-  or per-server semantics passes, and the report says which;
+- the row count is right (with `limit`, both whole-result and per-server
+  counts are accepted, and the report says which);
 - every returned row is a real record that satisfies the question, with no
-  duplicates and every selected value correct. This needs `component_id` and
-  `seq` in the result; otherwise only the count is checked;
-- rows are in the stated order, when the ordering columns are in the result;
-- every timed run returns the same number of rows as the verified run.
+  duplicates and every selected value correct (this needs `component_id` and
+  `seq` in the result; otherwise only the count is checked);
+- rows are in the stated order, when the ordering columns are in the result.
 
 Queries without a `match` description, or marked `"verify": false`, are run
-and timed and reported as INFO.
+and reported as INFO.
 
-`live` writes a new target, `LIVE_TARGET`, at `LIVE_RATE` records per second
-per server while the query node polls it with the query set's first query of
-type `all`. It passes when every answer contains only valid,
-non-duplicated records, the row count never decreases, and the final count is
-reached.
+### Timing
+
+The `query` phase runs each query `REPEAT` times (default 5) and records
+the duration of each run, from the start of `adapter.query()` until the
+last row has been fetched. It reports the median, p95 and minimum. The
+connection to the backend is made once, before any query, so timings do not
+include connecting.
+
+`QUERY_ADAPTER` selects the adapter within the backend; empty selects the
+backend's default. Each backend's README lists its available adapters.
+
+See `OUTPUT.md` for the exact timing boundaries and the full JSON result
+structure.
+
+### The live test
+
+`live` writes a new target at `LIVE_RATE` records per second per server
+while the query node polls it with the query set's first query of type
+`all`. It passes when every answer contains only valid, non-duplicated
+records, the row count never decreases, and the final count is reached.
+
+## Quick start
+
+1. Copy `bench.conf.example` to `bench.conf` and edit it: at minimum
+   `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_NODES`, `QUERY_NODE` and,
+   if the backend's software is not on the default paths, `ENV_SETUP`.
+2. Edit `backends/<BACKEND>/<BACKEND>_backend.conf` for each backend you
+   are using (see `backends/<n>/README.md` for what each setting does).
+3. Run the full sequence:
+
+```bash
+bin/run.sh -l ssh all
+```
+
+This runs the `all` phase sequence described above. Use `-l slurm` inside
+a Slurm allocation, or `-l manual` to run each step by hand. For Slurm
+batch jobs, `slurm/monbench.sbatch` is a starting point:
+
+```bash
+sbatch slurm/monbench.sbatch
+```
+
+Settings can be overridden per run (ssh and Slurm launchers only):
+
+```bash
+SAMPLES=500 WRITERS=c bin/run.sh -l ssh all
+```
+
+## Running multiple backend pairs
+
+To benchmark several write→query pairs (e.g. sos→dsos and influxdb→influxdb)
+without editing one config file back and forth, keep a separate `bench.conf`
+per pair and select it with `-c`:
+
+```bash
+bin/run.sh -c bench-sos-dsos.conf -l ssh all
+bin/run.sh -c bench-influxdb3.conf -l ssh all
+```
+
+Each config sets its own `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_NODES`,
+`QUERY_NODE` and any backend-specific settings. Results go to each config's
+own `RESULTS_DIR`.
 
 ## Query sets
 
 A query set is a JSON file. When `QUERY_FILE` is empty, the default set
-`queries/default.json` is used. To define your own, copy that file, edit it,
-and set `QUERY_FILE` in `bench.conf` or on the command line (ssh and Slurm
-launchers).
-
-Each query describes the **question** once, independently of any backend,
-and gives the **query string** for each backend:
+`queries/default.json` is used. Each query describes the **question** once,
+independently of any backend, and gives the **query string** for each
+backend:
 
 ```json
 {
@@ -208,7 +267,7 @@ and gives the **query string** for each backend:
 |---|---|
 | `name`, `type` | Labels for the report. The default set names types by the conditions the question uses, so the labels apply to every backend |
 | `match` | The question, used for verification: `where` conditions, `order_by` (the attributes the result is ordered by) and optionally `limit` |
-| `query` | Query strings keyed by adapter name or dialect (`dsos` covers both SOS adapters). A plain string is used for every adapter. An adapter with no string for a question reports it as SKIP |
+| `query` | Query strings keyed by adapter name or dialect (`dsos` covers the `dsos`, `dsosql` and `sos` adapters). A plain string is used for every adapter. An adapter with no string for a question reports it as SKIP |
 | `verify` | `false` to run and time the query without verifying it. Default `true` |
 
 `match.where` is conditions of the form `<attribute> <op> <number>` joined by
@@ -227,19 +286,10 @@ The default set covers:
 | `projection`, `limit` | Selected columns only; the first rows with `limit` |
 | `aggregate` | A `group_by` query; timed, not verified |
 
-Query strings and `match` may use these placeholders, filled in from the data
-set so that one file works at any size:
-
-| Placeholder | Value |
-|---|---|
-| `{schema}` | Schema name |
-| `{limit}` | `LIMIT_N` |
-| `{t_start}`, `{t_end}` | Timestamps of the first and last sample |
-| `{t_q1}`, `{t_mid}`, `{t_q3}` | Timestamps at 25%, 50% and 75% of the time span |
-| `{t_mid_1pct}` | 1% of the time span after `{t_mid}` |
-| `{comp_s0}`, `{comp_s0_last}` | First and last component on the first server |
-| `{comp_slast}`, `{comp_last}` | First component on the last server; last component overall |
-| `{job_first}`, `{job_mid}`, `{job_last}` | First job, the job at mid-span, last job |
+Query strings and `match` may use placeholders filled from the data set so
+that one file works at any size. See `EXTENDING.md`, "Writing a query file",
+for the full list of placeholders, the keying rules, and how to define your
+own query file.
 
 ## Output
 
@@ -250,6 +300,7 @@ set so that one file works at any size:
 - `results/benchmark-<target>-<adapter>.json`: each query with its
   expanded query string, status, row count, every timed run, median, p95,
   minimum and rows per second.
+- `results/benchmark-<target>-live.json`: live-poll result.
 - `results/logs/`: the full output of every remote step.
 
 See `OUTPUT.md` for the full JSON structure, what each field means, and
@@ -259,32 +310,12 @@ exactly what the write and query timing measurements cover.
 
 Points to be aware of when running the harness or interpreting its results.
 Design limitations and plans for later versions are tracked in `ROADMAP.md`.
+Backend-specific notes are in each backend's README under `backends/<n>/`.
 
-- **Timings use the Python API.** The `dsos` adapter returns DataFrames, so
-  its timings include building them, as an analyst's code would. They do not
-  show the fastest a C client could achieve.
-- **The Python `SqlQuery` batch fix is required.** Without the fix to
-  `SqlQuery.next()` in `Sos.pyx`, the `dsos` adapter loses one row per full
-  batch of `SOS_ROW_LIMIT` rows, and verified queries fail.
+- **Timings use the Python API.** All current adapters use Python client
+  libraries, so timings include Python-level overhead (e.g. building
+  DataFrames). They reflect what an analyst's code would experience, not the
+  fastest a native client could achieve.
 - **Data written by earlier versions has no metadata file.** The engine then
   verifies against the current settings and says so; rewrite the data to get
   a metadata file.
-- **`dsosql` output parsing (`dsosql` adapter only).** The adapter reads the
-  CSV block between the `# <columns>` header and the `# Records N.` footer,
-  after removing the `dsosql: ` prompt that `dsosql` prints even when its
-  input is a pipe.
-- **The `timestamp` output format.** The format `dsosql` prints for a
-  timestamp is not known. Seconds and `seconds.microseconds` are recognised;
-  other formats are reported as a note and are not validated.
-- **`group_by` syntax.** The syntax is not documented in the sources reviewed.
-  The `group_by` query in the default set is a best guess and is not
-  verified. Time binning (resampling) is not tested yet, for the same reason.
-- **Registering `dsosd` with `rpcbind` may require root.** If so, set
-  `DSOSD="sudo -E dsosd"` in `backends/dsos/dsos_backend.conf`. `-E` is needed so that `DSOSD_DIRECTORY` and
-  `DSOSD_SERVER_ID` reach `dsosd`. Stopping it then also requires sudo.
-- **The Python writer cannot request a synchronous close.** The bindings do
-  not export `SOS_COMMIT_SYNC`, so the writer calls `os.sync()` after closing
-  the container to make its timing comparable with the C writer.
-- **Where SOS containers are stored.** Containers are placed under
-  `SOS_DATA_ROOT/<server-id>/`, so a shared path is safe. A node-local path
-  gives the intended configuration.
