@@ -13,7 +13,7 @@ output formats) are in `README.md`, "Assumptions and limits".
 - **Out of scope** — deliberately not covered by the suite.
 - **Done** — completed; kept for the record of why.
 
-Last updated: 2026-10-01
+Last updated: 2026-10-07
 
 ---
 
@@ -150,6 +150,69 @@ Last updated: 2026-10-01
   * Options:
     * Additional shapes (wide, narrow, other entity models), each with its own value rules.
   * Status: **Deferred.**
+
+* **Per-CPU and per-interface records**
+  * Background:
+    * The default data set's attribute names and units are modeled on the
+      `curated_metrics` LDMS sampler plugin, which exposes `/proc/meminfo`,
+      `/proc/loadavg` and the scalar `/proc/stat` counters as flat metrics —
+      these are all in the default data set now (see `README.md`, "The data
+      set"). `curated_metrics` also exposes per-CPU-core `/proc/stat` fields
+      and per-network-interface `/proc/net/dev` fields, but as nested LDMS
+      *records*: a variable-length list of per-core or per-interface values
+      attached to each sample, not flat scalars.
+  * Current limitation:
+    * `core/bench.py`'s verifier (`parse_match`/`COND_RE`) only understands
+      `match.where` conditions of the form `attribute op number` against one
+      flat `ATTRS` tuple, and `Dataset.records()`/`expected()` produce one
+      flat row per `(component_id, seq)`. There is no concept of a nested
+      sub-row (one row per core or per interface within a sample), so
+      per-core/per-interface metrics cannot be added as-is: doing so needs
+      either a verifier that understands nested records and conditions that
+      reach into them, or flattening the records into the row some other
+      way.
+    * This was scoped out of the curated_metrics-alignment work (see git
+      history around 2026-10-07): that work added the 19 flat metrics only
+      and deliberately left the per-core/per-interface metrics out, rather
+      than attempting a verifier redesign under that task.
+  * Options:
+    * **Wide columns (recommended starting point).** Flatten a fixed number
+      of cores/interfaces per component into named scalar attributes —
+      `cpu0_user`, `cpu0_idle`, ..., `cpu3_idle`, `eth0_rx_bytes`,
+      `eth0_tx_bytes`, `eth1_rx_bytes`, `eth1_tx_bytes` — each a deterministic
+      function of `(component_id, seq)` like every other attribute. This
+      needs no verifier change at all: it is just more entries in `ATTRS` and
+      `Dataset.expected()`, exactly like this task's 19 new metrics. The
+      fixed count must be the same for every component. **4 CPU cores and 2
+      network interfaces per component** is a reasonable default scale for
+      synthetic data (matches common small HPC node configurations) and is
+      recommended if/when this is implemented, unless a specific site's node
+      shape calls for a different number.
+    * **True nested records.** Model cores/interfaces as an actual nested
+      sub-row per sample, closer to what `curated_metrics` really exposes on
+      the wire. This needs: a second-level `ATTRS`-like tuple per record
+      type, a `Dataset.expected()` that returns nested structures, a verifier
+      that can express and check conditions over the nested rows (e.g. "any
+      core's `idle` < X", "interface `eth0`'s `rx_bytes` over a window"), and
+      backend-specific schema/writer support for a one-to-many shape (SOS
+      sub-objects or a join schema; a separate InfluxDB measurement keyed by
+      component_id+core/interface index). This is a genuine framework
+      redesign, not an incremental attribute addition — substantially more
+      work than the wide-columns option, and was the reason this was deferred
+      rather than attempted as part of adding the flat metrics.
+  * Status: **Deferred.** Recommended path when picked up: wide columns, 4
+    cores + 2 interfaces per component, as a straightforward extension of
+    `ATTRS`/`Dataset.expected()`; revisit true nested records only if a
+    benchmark question specifically needs per-core/per-interface filtering
+    or aggregation that wide columns cannot express.
+
+    **Note (2026-10-09): superseded in part.** `design/value-generation.md`
+    Sec 6 and `core/dataset.py`/`core/valuegen.py` now implement true nested
+    component-kind records generically (any kind/attributes a dataset
+    declares, not a fixed cpu/netdev pair) — see `dataset/curated_metrics_like.json`
+    and `STATUS.md`. The "wide columns" option above was not taken. Backend
+    schema mapping and native queries for this are implemented for InfluxDB
+    only so far (`STATUS.md`); SOS/DSOS mapping remains open.
 
 * **No support for existing data from other sources**
   * Current limitation:

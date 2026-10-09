@@ -31,7 +31,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from adapter import BackendError                      # noqa: E402
-from dataset import ATTRS, Dataset, read_meta         # noqa: E402
+from dataset import Dataset, IDENTITY_ATTRS, read_meta  # noqa: E402
 
 # ----------------------------------------------------------------- settings
 
@@ -109,11 +109,22 @@ def validate_rows(rows):
     """Check each row against the data set.
 
     Only the columns present are checked, so queries that select a subset of
-    columns can be verified. Returns (problems, keys, warnings); keys lists
-    (component_id, seq) for each row.
+    columns can be verified. Checks every flat attribute the dataset
+    declares, generically (float attributes with a small tolerance, others
+    for exact equality, strings for exact equality), so a custom or
+    expanded data set is validated without code changes here. This checks
+    values *within* an already-returned flat row; it does not validate
+    component-level attribute values, since no backend schema maps a
+    component kind onto a returned row yet (design/value-generation.md
+    Sec 6.5's backend-mapping table). Filtering a query's expected result
+    set by a component-level condition (kind[i].attr / kind[*].attr /
+    count(kind)) is separate and is handled by record_matches()/verify().
+    Returns (problems, keys, warnings); keys lists (component_id, seq) for
+    each row.
     """
     problems, keys = [], []
     ts_unparsed = 0
+    check_names = [n for n in DS.attr_names if n not in IDENTITY_ATTRS]
     for n, r in enumerate(rows):
         try:
             comp, seq = int(r["component_id"]), int(r["seq"])
@@ -122,15 +133,22 @@ def validate_rows(rows):
             continue
         keys.append((comp, seq))
         exp = DS.expected(comp, seq)
-        try:
-            if "job_id" in r and int(r["job_id"]) != exp["job_id"]:
-                problems.append(f"row {n}: job_id {r['job_id']} != {exp['job_id']}")
-            if "mem_free" in r and int(r["mem_free"]) != exp["mem_free"]:
-                problems.append(f"row {n}: mem_free {r['mem_free']} != {exp['mem_free']}")
-            if "load" in r and abs(float(r["load"]) - exp["load"]) > 1e-6:
-                problems.append(f"row {n}: load {r['load']} != {exp['load']}")
-        except (ValueError, TypeError) as e:
-            problems.append(f"row {n}: cannot parse value ({e}): {r}")
+        for name in check_names:
+            if name not in r:
+                continue
+            want = exp[name]
+            try:
+                attr_type = DS.attr_type(name)
+                if attr_type == "double":
+                    if abs(float(r[name]) - want) > 1e-6:
+                        problems.append(f"row {n}: {name} {r[name]} != {want}")
+                elif attr_type == "string":
+                    if str(r[name]) != str(want):
+                        problems.append(f"row {n}: {name} {r[name]!r} != {want!r}")
+                elif int(r[name]) != int(want):
+                    problems.append(f"row {n}: {name} {r[name]} != {want}")
+            except (ValueError, TypeError) as e:
+                problems.append(f"row {n}: cannot parse {name} ({e}): {r}")
         if "timestamp" in r:
             ts = parse_ts(r["timestamp"])
             if ts is None:
@@ -155,7 +173,24 @@ def is_sorted(values):
 OPS = {"==": lambda a, b: a == b, "!=": lambda a, b: a != b,
        "<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
        ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
-COND_RE = re.compile(r"^\(?\s*(\w+)\s*(==|!=|<=|>=|<|>)\s*(-?[\d.]+)\s*\)?$")
+CMP = r"==|!=|<=|>=|<|>"
+# A condition value is a number or a quoted string literal (design doc
+# Sec 6.5's STRING_LITERAL -- a string-typed attribute decodes to a Python
+# str, so string equality is just that value compared to the literal,
+# same comparison form as a number).
+VALUE = r"-?[\d.]+|'[^']*'|\"[^\"]*\""
+NODE_COND_RE = re.compile(rf"^\(?\s*(\w+)\s*({CMP})\s*({VALUE})\s*\)?$")
+# kind[i].attr cmp value / kind[*].attr cmp value -- Sec 6.5's comp_cond.
+COMP_COND_RE = re.compile(rf"^\(?\s*(\w+)\[(\d+|\*)\]\.(\w+)\s*({CMP})\s*({VALUE})\s*\)?$")
+# count(kind) cmp n -- Sec 6.5's count_cond. Always an integer comparison.
+COUNT_COND_RE = re.compile(rf"^\(?\s*count\((\w+)\)\s*({CMP})\s*(-?\d+)\s*\)?$")
+
+
+def parse_cond_value(raw):
+    """A condition literal: a quoted string (either quote style) or a number."""
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return float(raw)
 
 
 def fill(value, values, where):
@@ -177,21 +212,82 @@ def parse_match(match):
     """Turn a 'match' description into conditions the verifier can apply.
 
     Returns (spec, reason); reason is set when the description cannot be used.
+    Implements design/value-generation.md Sec 6.5's full condition grammar:
+    a node-level 'attr cmp value' (as before, now also accepting a quoted
+    string literal for string-typed attributes), a component-level
+    'kind[i].attr cmp value' or existential 'kind[*].attr cmp value', and a
+    cardinality 'count(kind) cmp n'. Attribute and kind names are resolved
+    against the current dataset's own declaration (DS), not a fixed
+    suite-wide list, so a custom dataset's 'where'/'order_by' just work.
+
+    Each entry in spec["conds"] is one of:
+      ("node", attr_index, op, value)
+      ("comp", kind, index_or_None, attr, op, value)   # index None = 'kind[*]'
+      ("count", kind, op, n)
     """
     spec = {"conds": [], "order_by": match.get("order_by") or [],
             "limit": int(match["limit"]) if match.get("limit") not in (None, "") else None}
     where = (match.get("where") or "").strip()
     if where:
-        for term in re.split(r"\s+and\s+", where, flags=re.IGNORECASE):
-            c = COND_RE.match(term.strip())
-            if not c or c.group(1) not in ATTRS:
-                return None, f"match condition '{term.strip()}' not understood"
-            spec["conds"].append((ATTRS.index(c.group(1)), OPS[c.group(2)],
-                                  float(c.group(3))))
-    unknown = [a for a in spec["order_by"] if a not in ATTRS]
+        for raw_term in re.split(r"\s+and\s+", where, flags=re.IGNORECASE):
+            term = raw_term.strip()
+            c = COUNT_COND_RE.match(term)
+            if c:
+                kind, op, n = c.groups()
+                if DS.component_kind(kind) is None:
+                    return None, f"match condition '{term}' names unknown component kind '{kind}'"
+                spec["conds"].append(("count", kind, OPS[op], int(n)))
+                continue
+            c = COMP_COND_RE.match(term)
+            if c:
+                kind, idx, attr, op, raw_value = c.groups()
+                ck = DS.component_kind(kind)
+                if ck is None or attr not in [a["name"] for a in ck.get("attributes", [])]:
+                    return None, f"match condition '{term}' not understood"
+                spec["conds"].append(("comp", kind, None if idx == "*" else int(idx),
+                                      attr, OPS[op], parse_cond_value(raw_value)))
+                continue
+            c = NODE_COND_RE.match(term)
+            if not c or c.group(1) not in DS.attr_names:
+                return None, f"match condition '{term}' not understood"
+            attr, op, raw_value = c.groups()
+            spec["conds"].append(("node", DS.attr_names.index(attr), OPS[op],
+                                  parse_cond_value(raw_value)))
+    unknown = [a for a in spec["order_by"] if a not in DS.attr_names]
     if unknown:
         return None, f"match order_by names unknown attributes {unknown}"
     return spec, None
+
+
+def cond_matches(cond, comp, seq, node_record):
+    """One condition's match(...) from Sec 6.5, evaluated at coordinate (comp, seq).
+
+    *node_record* is this row's flat-attribute tuple in DS.attr_names order
+    (what DS.records() yields), used for "node" conditions without a second
+    recomputation. "comp"/"count" conditions call DS.expected_count() /
+    DS.expected_component_attr(), which recompute directly rather than
+    generating every instance of the kind (DS.expected_components()) --
+    the narrow primitives Sec 6.5 calls expected_count() and
+    evaluate(attr, C_i).
+    """
+    tag = cond[0]
+    if tag == "node":
+        _, i, op, v = cond
+        return op(node_record[i], v)
+    if tag == "count":
+        _, kind, op, n = cond
+        return op(DS.expected_count(kind, comp, seq), n)
+    # tag == "comp"
+    _, kind, idx, attr, op, v = cond
+    n = DS.expected_count(kind, comp, seq)
+    if idx is not None:
+        return idx < n and op(DS.expected_component_attr(kind, idx, attr, comp, seq), v)
+    return any(op(DS.expected_component_attr(kind, i, attr, comp, seq), v) for i in range(n))
+
+
+def record_matches(spec, comp, seq, node_record):
+    """match(condition, C) for every condition in spec["conds"], ANDed (Sec 6.5)."""
+    return all(cond_matches(cond, comp, seq, node_record) for cond in spec["conds"])
 
 
 def load_query_set(path, adapter):
@@ -237,7 +333,10 @@ def load_query_set(path, adapter):
 
 def verify(spec, columns, rows):
     """Compare a full result with the records the question should return."""
-    expected = [r for r in DS.records() if all(op(r[i], v) for i, op, v in spec["conds"])]
+    idx_comp = DS.attr_names.index("component_id")
+    idx_seq = DS.attr_names.index("seq")
+    expected = [r for r in DS.records()
+               if record_matches(spec, r[idx_comp], r[idx_seq], r)]
     have_key = "component_id" in columns and "seq" in columns
     problems, notes = [], []
     got = want = None
@@ -245,7 +344,7 @@ def verify(spec, columns, rows):
         vp, keys, warn = validate_rows(rows)
         problems += vp[:3]
         notes += warn
-        want = {(r[1], r[3]) for r in expected}
+        want = {(r[idx_comp], r[idx_seq]) for r in expected}
         got = set(keys)
         if len(keys) != len(got):
             problems.append(f"{len(keys) - len(got)} duplicate rows")
@@ -264,7 +363,7 @@ def verify(spec, columns, rows):
         # How a limit is applied differs between backends: to the whole
         # result, or on each server to its own partition. Both are accepted.
         per_server = sum(min(spec["limit"],
-                             sum(1 for r in expected if DS.partition_of(r[1]) == p))
+                             sum(1 for r in expected if DS.partition_of(r[idx_comp]) == p))
                          for p in range(DS.partitions))
         overall = min(spec["limit"], len(expected))
         if n == overall:

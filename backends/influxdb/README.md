@@ -14,6 +14,7 @@ server, so together the nodes write the whole data set once.
 | Reads data written by | `influxdb` |
 | Service | Yes (`PLUGIN_SERVICE=1`); the harness starts and stops `influxdb3` and generates its admin token |
 | Partitioning | Data is generated per server but all sent to one server, not sharded |
+| Component kinds (design/value-generation.md Sec 6) | Yes -- see "Component-kind data model mapping" below |
 
 ## Data model mapping
 
@@ -23,8 +24,43 @@ The data set maps to InfluxDB as:
 |---|---|
 | data set name (`{schema}`) | measurement (table) |
 | `component_id`, `job_id` | tags |
-| `seq`, `mem_free`, `load` | fields (`seq` kept so rows can be identified in verification) |
+| every other attribute (`seq`, `MemTotal`, `free`, ..., `procs_blocked`) | fields (`seq` kept so rows can be identified in verification) |
 | `timestamp` | point time |
+
+## Component-kind data model mapping
+
+A dataset may also declare component kinds (design/value-generation.md Sec
+6) -- a flat (scalar-attribute) record type with a variable, per-sample
+instance count, nested one level below the node (e.g. `cpu`, `netdev` in
+`dataset/curated_metrics_like.json`). Each kind gets its own InfluxDB
+measurement, generic over however many kinds a dataset declares:
+
+| Component kind | InfluxDB |
+|---|---|
+| kind name | measurement `{schema}_<kind>` (e.g. `monitoring_nested_cpu`) |
+| `component_id`, `job_id`, `component_index` | tags |
+| the kind's own attributes, plus `seq` | fields (`seq` kept for the same reason as the flat measurement's) |
+| `timestamp` of the node sample this instance belongs to | point time |
+
+A component measurement joins back to the flat node measurement on
+`(component_id, time)` -- that pair already uniquely identifies
+`(component_id, seq)`, and `job_id` is a deterministic function of `seq`
+(`1 + seq // JOB_LEN`), so it never disagrees with that join. A query
+translating the `match.where` grammar's `kind[i].attr`/`kind[*].attr`/
+`count(kind)` conditions (design doc Sec 6.5) into native SQL joins the
+node measurement to the kind's measurement this way, filters on the
+kind's fields (and `component_index` for the `kind[i]` form, or a
+`GROUP BY component_id, time HAVING COUNT(*) ...` subquery for
+`count(kind)`), and selects the *node* measurement's columns -- so the
+result is still node-shaped rows that `core/bench.py`'s existing
+verifier (which recomputes the expected node-row set, not component
+rows) can check unchanged. See `queries/curated_metrics.json` for worked
+examples against `dataset/curated_metrics_like.json`.
+
+A dataset with no `"components"` declared (e.g. `dataset/default.json`)
+writes and queries exactly as before -- `influx_write.py` writes no
+component measurements and `queries/default.json` has no `match.where`
+of this form.
 
 ## Write methods
 
@@ -49,7 +85,8 @@ The query adapter supports InfluxDB 3's two query languages, selected with
 
 The interface for querying follows `INFLUX_INTERFACE` (the `python` client uses
 Arrow Flight; `http` uses the query API). Query strings for InfluxDB go in a
-query set under the `influxdb` adapter name.
+query set under the `influxdb` adapter name. Component-kind queries (see
+above) need the `sql` dialect -- InfluxQL has no JOIN.
 
 ## Configuration
 

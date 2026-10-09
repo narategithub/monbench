@@ -112,10 +112,10 @@
     {
       "name": "condition on a metric value",
       "type": "metric-value",
-      "match": { "where": "load < 4", "order_by": ["timestamp"] },
+      "match": { "where": "free < 50", "order_by": ["timestamp"] },
       "query": {
-                 "dsos": "select * from {schema} where load < 4 order_by timestamp",
-                 "influxdb": "SELECT * FROM {schema} WHERE load < 4 ORDER BY timestamp"
+                 "dsos": "select * from {schema} where free < 50 order_by timestamp",
+                 "influxdb": "SELECT * FROM {schema} WHERE free < 50 ORDER BY timestamp"
                }
     },
     {
@@ -123,8 +123,8 @@
       "type": "projection",
       "match": { "where": "timestamp >= {t_q3}", "order_by": ["timestamp"] },
       "query": {
-                 "dsos": "select component_id, seq, load from {schema} where timestamp >= {t_q3} order_by timestamp",
-                 "influxdb": "SELECT component_id, seq, load FROM {schema} WHERE timestamp >= {t_q3} ORDER BY timestamp"
+                 "dsos": "select component_id, seq, free from {schema} where timestamp >= {t_q3} order_by timestamp",
+                 "influxdb": "SELECT component_id, seq, free FROM {schema} WHERE timestamp >= {t_q3} ORDER BY timestamp"
                }
     },
     {

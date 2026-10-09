@@ -7,7 +7,7 @@ monbench writes a deterministic monitoring-style data set into a database
 backend, then runs a set of queries against it from a separate query node,
 verifying every answer and timing every query. The core of the suite knows
 nothing about any particular database: each backend is a plugin under
-`backends/`. The first plugins are SOS/DSOS and InfluxDB; `backends/template/`
+`backends/`. The first plugins are SOS, DSOS and InfluxDB; `backends/template/`
 is the starting point for others.
 
 ```
@@ -42,21 +42,21 @@ is the starting point for others.
 ## Write and query backends
 
 The suite separates writing from querying. `WRITE_BACKEND` names the backend
-that writes the data; `QUERY_BACKEND` names the one that queries it. They are
-often the same, but there are use cases that the ingress and egress backend are
-different. For example, writes with `sos` (local SOS containers) and queries
-with `dsos` (distributed queries through `dsosd`). Tested pairs:
-
-| `WRITE_BACKEND` | `QUERY_BACKEND` | Description |
-|---|---|---|
-| `sos` | `dsos` | Write locally, query through dsosd |
-| `sos` | `sos` | Write and query locally — single-node or shared-filesystem comparison |
-| `dsos` | `dsos` | Write and query through dsosd |
-| `influxdb` | `influxdb` | Write and query InfluxDB v3 |
+that writes the data; `QUERY_BACKEND` names the one that queries it. They can
+be the same backend or different ones, depending on what you want to measure.
 
 Set both in `bench.conf`. The run stops with an error if a backend does not
 exist, if its data was written for a different backend, or if the query
 adapter cannot reach it.
+
+### Example scenarios
+
+| `WRITE_BACKEND` | `QUERY_BACKEND` | What it measures |
+|---|---|---|
+| `sos` | `dsos` | The primary HPC deployment: writers store data locally on each server for speed; queries go through `dsosd`, which fans out to every server and merges the results |
+| `sos` | `sos` | Query performance without RPC overhead — the query node opens each server's containers directly on disk. Useful as a single-node baseline or on a shared filesystem |
+| `dsos` | `dsos` | Both writes and queries go through `dsosd`, so the benchmark includes the distributed-write path as well |
+| `influxdb` | `influxdb` | InfluxDB v3 end-to-end, for comparison against the SOS/DSOS results on the same data set and queries |
 
 ## Requirements
 
@@ -78,15 +78,27 @@ a function of its `component_id` and `seq` (the sample number, 0 through
 `SAMPLES − 1`), so any row can be verified on its own. `seq` is stored as
 an attribute alongside the computed values; it has no physical meaning
 outside the benchmark but is what makes every row uniquely identifiable for
-verification. The value rules are defined in `core/dataset.py`:
+verification.
+
+The attribute names and units follow the flat (non-record) metrics of the
+`curated_metrics` LDMS sampler plugin: `/proc/meminfo` percentages and
+`MemTotal`, `/proc/loadavg`, and the scalar `/proc/stat` counters. The exact
+value rules are defined in `core/dataset.py`, which the query engine also
+verifies every answer against:
 
 | Attribute | Value |
 |---|---|
 | `component_id` | `(partition + 1) × 1000 + c`, for c in `[0, COMPONENTS_PER_NODE)` |
 | `timestamp` | `T0 + seq × INTERVAL` |
 | `job_id` | `1 + seq ÷ JOB_LEN` (integer division; each job spans all servers) |
-| `mem_free` | `component_id × 1,000,000 + seq` |
-| `load` | `(component_id mod 1000) + seq × 0.25` |
+| `MemTotal`, `free`, `buff`, `cached`, `active`, `inactive`, `dirty`, `writeback` | `/proc/meminfo`-style total (kB) and percentages, each a different deterministic function of `component_id` and `seq` |
+| `load1min`, `load5min`, `load15min` | `/proc/loadavg`-style load averages |
+| `runnable`, `scheduling_entities`, `newest_pid` | the runnable/total scheduling-entity counts and newest PID that accompany `/proc/loadavg` |
+| `interrupts`, `context_sw`, `fork`, `procs_running`, `procs_blocked` | `/proc/stat`-style scalar counters |
+
+Per-CPU-core and per-network-interface metrics, which `curated_metrics`
+exposes as nested LDMS records, are not part of the default data set; see
+`ROADMAP.md`, "Per-CPU and per-interface records".
 
 `dataset/default.json` lists the attributes and the **keys** the data set is
 meant to be queried by: `timestamp`, `comp_time` (component_id, timestamp)
@@ -282,7 +294,7 @@ The default set covers:
 | `component`, `component+time` | One component, alone and within a time window. The time-window question is asked three times, through the `comp_time`, `timestamp` and `job_comp_time` indices, to show the effect of the index choice |
 | `job`, `job+component`, `job+component+time` | One, two and all three attributes of the `job_comp_time` key |
 | `job+time` | Job and time without component: a gap in the `job_comp_time` key |
-| `metric-value` | A condition on `load`, which has no index |
+| `metric-value` | A condition on `free`, which has no index |
 | `projection`, `limit` | Selected columns only; the first rows with `limit` |
 | `aggregate` | A `group_by` query; timed, not verified |
 

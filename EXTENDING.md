@@ -188,14 +188,18 @@ Start with a small dataset (`SAMPLES=100 COMPONENTS_PER_NODE=4`) to iterate quic
 
 The default dataset (`dataset/default.json` + the value rules in
 `core/dataset.py`) is a monitoring shape: one record per component per
-sample, with attributes like those of an LDMS metric set. To benchmark a
+sample, with attribute names and units following the flat (non-record)
+metrics of the `curated_metrics` LDMS sampler plugin. To benchmark a
 different data shape, you define a new dataset.
 
 A dataset has two parts:
 
 ### The definition file: `dataset/<n>.json`
 
-A JSON file that lists the attributes, their types, and the access keys:
+A JSON file that lists the attributes, their types, and the access keys. The
+default dataset's own `dataset/default.json` looks like this (trimmed to a
+few attributes for illustration — the real file has 19 metric attributes;
+see `dataset/default.json` for the full list):
 
 ```json
 {
@@ -206,8 +210,9 @@ A JSON file that lists the attributes, their types, and the access keys:
     { "name": "component_id", "type": "uint64" },
     { "name": "job_id",       "type": "uint64" },
     { "name": "seq",          "type": "uint64" },
-    { "name": "mem_free",     "type": "uint64" },
-    { "name": "load",         "type": "double" }
+    { "name": "MemTotal",     "type": "uint64" },
+    { "name": "free",         "type": "double" },
+    { "name": "load1min",     "type": "double" }
   ],
   "keys": [
     { "name": "timestamp",     "attrs": ["timestamp"] },
@@ -223,29 +228,41 @@ A JSON file that lists the attributes, their types, and the access keys:
 | `attributes` | The columns. `name` is how queries and the verifier refer to each one. `type` is used by `type_overrides` to apply per-backend column renaming and literal formatting |
 | `keys` | The access paths the data is meant to be queried by; each backend maps them onto its own indexing (e.g. SOS creates an index for each, InfluxDB maps tags) |
 
+A dataset may also declare `components`: zero or more component kinds, each
+a flat record type with a variable, per-sample instance count, nested one
+level below the node (design/value-generation.md Sec 6) — see
+`dataset/curated_metrics_like.json` for a worked example (`cpu`, `netdev`).
+This is generated and verified generically by `core/dataset.py`/`core/
+valuegen.py` and `core/bench.py` with no code change needed per dataset;
+whether a *backend* can write and natively query a given dataset's component
+kinds is a separate, per-backend question (see "Writing a new backend"
+above and `STATUS.md` for which backends currently do).
+
 Set `DATASET` in `bench.conf` to point to your definition file:
 
 ```bash
 DATASET="${BENCH_DIR}/dataset/my-shape.json"
 ```
 
-### The value rules: `core/dataset.py`
+### The value rules: `core/dataset.py` / `core/valuegen.py`
 
-The value rules are code: given a `component_id` and a `seq` (sample number),
-they define the exact value of every attribute. The query engine verifies
-answers against them, and every writer must produce records that match.
+The value rules are a deterministic, hash-based function of each attribute's
+identifying coordinates (dataset name, attribute name, component kind/index,
+node id, job id, sample sequence) — see `design/value-generation.md`. They
+need no per-dataset code: any dataset JSON under `dataset/` is generated and
+verified by the same `core/valuegen.py` (plus its C port, `core/valuegen.c`,
+used by C writers) and `core/dataset.py`/`core/dataset.c`. Every Python
+writer and `core/bench.py` itself call `Dataset.expected()`/
+`Dataset.expected_components()` directly, so they pick up a new dataset
+automatically; `backends/sos/writer/sos_write.c` likewise calls into
+`core/dataset.c`/`core/valuegen.c` rather than reimplementing anything.
 
-Currently the value rules are hardcoded in `core/dataset.py` for the default
-monitoring shape and are tied to a fixed set of attribute names (`timestamp`,
-`component_id`, `job_id`, `seq`, `mem_free`, `load`). Supporting a second
-data shape requires adding a second set of value rules and selecting between
-them based on the dataset definition. The current version does not have this
-dispatch; it is tracked in `ROADMAP.md` under "One data shape".
-
-To add a new shape today: define its attributes and keys in a new
-`dataset/<n>.json`, then modify `core/dataset.py` to recognise the new
-attribute set and define value rules for it. Each writer must also be updated
-(or a new one written) to produce the new shape's records.
+Per-CPU-core and per-network-interface metrics (which `curated_metrics`
+models as nested LDMS records — a variable-length list of per-core or
+per-interface values per sample) are supported as component kinds (above),
+one level of nesting below the node; a component kind's own attribute
+containing a further nested list is out of scope — see
+design/value-generation.md Sec 6.6.
 
 ## Writing a query file
 
@@ -292,9 +309,23 @@ backend's query language:
 
 | Key | Purpose |
 | --- | --- |
-| `where` | Conditions of the form `<attribute> <op> <number>` joined by `and`, with op one of `==`, `!=`, `<`, `<=`, `>`, `>=`. No `or`, no aggregates |
+| `where` | Conditions joined by `and`, with op one of `==`, `!=`, `<`, `<=`, `>`, `>=`. No `or`, no aggregates. Three condition forms, generic over any attribute or declared component kind the dataset defines (see `design/value-generation.md` Sec 6.5): a flat condition `<attribute> <op> <value>`; a component condition `<kind>[<i>].<attribute> <op> <value>` (a specific instance) or `<kind>[*].<attribute> <op> <value>` (true if any instance of that kind matches); and a cardinality condition `count(<kind>) <op> <n>`. `<value>` is a number, or a quoted string (`'...'` or `"..."`) for a `string`-typed attribute |
 | `order_by` | List of attribute names the result must be ordered by |
 | `limit` | Maximum number of rows (the verifier accepts both whole-result and per-server semantics) |
+
+Component conditions describe the question in backend-neutral terms for
+verification; a backend also needs its own native query against however it
+stores that component kind to actually answer the question (the backend
+mapping in `design/value-generation.md` Sec 6.5). **The InfluxDB backend
+now has this**: a component kind is written to its own measurement
+(`backends/influxdb/README.md`'s "Component-kind data model mapping"), and a
+native SQL query joins it back to the node measurement on `(component_id,
+timestamp)` to answer `kind[i].attr`/`kind[*].attr`/`count(kind)` — see
+`queries/curated_metrics.json` for worked examples against
+`dataset/curated_metrics_like.json`. SOS and DSOS do not yet map component
+kinds onto their own schemas, so a `match.where` using this grammar has no
+native query string for those adapters yet and reports SKIP (see
+`STATUS.md`).
 
 Backend-specific choices — which index to use, SQL syntax differences,
 function calls — belong in the query string only, not in `match`.
@@ -329,13 +360,22 @@ filled from the dataset so that one file works at any data-set size:
 | `{comp_slast}`, `{comp_last}` | First component on the last server; last component overall |
 | `{job_first}`, `{job_mid}`, `{job_last}` | First job, the job at mid-span, last job |
 
+A component-kind measurement name is not a separate placeholder: write it as
+`{schema}_<kind>` directly in the query string (e.g. `{schema}_cpu`) — the
+`{schema}` placeholder still expands normally, leaving the kind suffix as
+literal text, exactly like `queries/curated_metrics.json`'s queries do.
+
 Placeholder values for types that have a `"literal"` entry in the adapter's
 `type_overrides` are automatically wrapped with the backend's native syntax
 (e.g. InfluxDB timestamps become `to_timestamp_seconds(...)`) — you write
 bare `{t_mid}` in the query string, and the engine handles the wrapping.
 Column renaming from `type_overrides` is applied to the query template before
 placeholders are expanded, so that literal format strings that contain
-dataset attribute names (e.g. `to_timestamp_seconds`) are not mangled.
+dataset attribute names (e.g. `to_timestamp_seconds`) are not mangled. This
+also means a dataset attribute name that is a plain-text substring of a
+component-kind measurement name (none of the current datasets have one)
+would be rewritten too — not a concern today, but worth knowing if you name
+attributes and measurements close together.
 
 ### Tips
 

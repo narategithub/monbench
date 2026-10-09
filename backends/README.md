@@ -63,8 +63,9 @@ Two options in `backends/influxdb/influxdb_backend.conf`:
 - `INFLUX_QUERY_LANG`: `sql` (default) or `influxql`.
 
 The data set maps to InfluxDB as: measurement = the data set name
-(`{schema}`); tags = `component_id`, `job_id`; fields = `seq`, `mem_free`,
-`load`. `seq` is kept as a field so verification can identify each row.
+(`{schema}`); tags = `component_id`, `job_id`; fields = every other dataset
+attribute, including `seq` (kept as a field so verification can identify
+each row).
 
 Requirements: an InfluxDB 3 server reachable at `INFLUX_HOST`. The `python`
 interface also needs `pip install influxdb3-python` on the write and query

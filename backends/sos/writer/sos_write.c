@@ -3,16 +3,36 @@
  * container using the SOS C API.
  *
  * Every record is a pure function of (component_id, seq), so any reader
- * can verify a record without knowing which node wrote it:
+ * can verify a record without knowing which node wrote it. component_id,
+ * timestamp, job_id and seq follow:
  *
  *   component_id = (node_index + 1) * 1000 + c        c in [0, components)
  *   timestamp    = t0 + seq * interval                seq in [0, samples)
  *   job_id       = 1 + seq / job_len
- *   mem_free     = component_id * 1000000 + seq
- *   load         = (component_id % 1000) + seq * 0.25
  *
- * This is the data set defined in core/dataset.py, which the query engine
- * verifies against; the Python writer (sos_write.py) produces the same.
+ * Every other attribute's value comes from the dataset named by the
+ * DATASET env var (see core/dataset.h), loaded and resolved once by
+ * core/dataset.c and evaluated per record by core/valuegen.c -- this
+ * file has no attribute-specific formula of its own and no JSON-parsing
+ * of the dataset declaration. That parsing and default-resolution logic
+ * lives once, in core/dataset.c, precisely so that this writer (and any
+ * other non-Python writer) does not reimplement it; core/dataset.py is
+ * the equivalent shared layer the Python writers call, and
+ * design/value-generation.md is the design both sides follow.
+ *
+ * This is the data set defined by the DATASET env var's JSON file,
+ * which the query engine verifies against; sos_write.py (and every
+ * other writer) produces the same records by calling the same shared
+ * layer, in their language's form of it.
+ *
+ * Scope note: today's dataset JSON files only declare uintN and double
+ * attributes outside the identity ones, and this writer only supports
+ * those two families -- the same scope the writer has always had (it
+ * previously hardcoded exactly uint64/double metrics). A dataset
+ * attribute of another family (int, string) is rejected with an error
+ * rather than silently mishandled; SOS's own type_map below also has no
+ * entry for UINT8/INT8/STRING, a separate, pre-existing backend
+ * limitation this writer does not attempt to paper over.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -27,6 +47,7 @@
 #include <uuid/uuid.h>
 #include <jansson.h>
 #include <sos/sos.h>
+#include "dataset.h"
 
 #define MAX_JOIN_ATTRS 16
 
@@ -50,7 +71,8 @@ static void usage(const char *prog)
 		"usage: %s --path PATH --template JSON --node-index N\n"
 		"          [--components N] [--samples N] [--t0 SECS] [--interval SECS]\n"
 		"          [--job-len N] [--batch N] [--rate RECS_PER_SEC]\n"
-		"          [--storage mmos|lsos]\n", prog);
+		"          [--storage mmos|lsos]\n"
+		"       (DATASET env var must name the dataset JSON file)\n", prog);
 	exit(2);
 }
 
@@ -86,7 +108,10 @@ static int lookup_type(const char *name, sos_type_t *type)
 
 /*
  * Build a schema from the same JSON template the Python Schema.from_template()
- * method accepts, so that both writers produce an identical schema.
+ * method accepts, so that both writers produce an identical schema. This
+ * part is unrelated to value generation (it only maps the template's own
+ * declared attribute types onto SOS's), so it is unchanged by the move
+ * to core/dataset.c below.
  */
 static sos_schema_t schema_from_template(const char *path)
 {
@@ -233,6 +258,15 @@ static sos_attr_t must_attr(sos_schema_t schema, const char *name)
 	return attr;
 }
 
+/* One non-identity dataset attribute, resolved to both its SOS attr
+ * handle and the index ds_expected() will fill its value at -- built
+ * once from the loaded dataset_t, used by every record. */
+struct value_attr {
+	sos_attr_t sos_attr;
+	size_t idx;		/* index into dataset_t.attrs[] / ds_expected()'s values[] */
+	ds_family_t family;
+};
+
 int main(int argc, char **argv)
 {
 	struct opts o = {
@@ -275,6 +309,25 @@ int main(int argc, char **argv)
 	    !o.batch || !o.job_len || !o.interval)
 		usage(argv[0]);
 
+	const char *dataset_path = getenv("DATASET");
+	if (!dataset_path) {
+		fprintf(stderr, "error: DATASET env var is not set\n");
+		return 1;
+	}
+	/* The authoritative attribute list, types, and decode rules come
+	 * from the dataset definition (DATASET env var) -- loaded and
+	 * resolved once here via core/dataset.c, the same file
+	 * sos_write.py, dsos_write.py and influx_write.py all load
+	 * through core/dataset.py, so every writer produces identical
+	 * values for a given dataset with no change needed here when the
+	 * dataset's JSON changes. */
+	dataset_t ds;
+	char ds_err[256];
+	if (ds_load(&ds, dataset_path, o.t0, o.interval, o.job_len, ds_err, sizeof(ds_err))) {
+		fprintf(stderr, "error loading dataset '%s': %s\n", dataset_path, ds_err);
+		return 1;
+	}
+
 	sos_perm_t perm = SOS_PERM_CREAT | SOS_PERM_RW;
 	perm |= (0 == strcasecmp(o.backend, "lsos")) ? SOS_BE_LSOS : SOS_BE_MMOS;
 
@@ -291,8 +344,34 @@ int main(int argc, char **argv)
 	sos_attr_t a_comp = must_attr(schema, "component_id");
 	sos_attr_t a_job = must_attr(schema, "job_id");
 	sos_attr_t a_seq = must_attr(schema, "seq");
-	sos_attr_t a_mem = must_attr(schema, "mem_free");
-	sos_attr_t a_load = must_attr(schema, "load");
+	int idx_ts = ds_attr_index(&ds, "timestamp");
+	int idx_comp = ds_attr_index(&ds, "component_id");
+	int idx_job = ds_attr_index(&ds, "job_id");
+	int idx_seq = ds_attr_index(&ds, "seq");
+
+	/* Resolve every other dataset attribute to its SOS attr handle
+	 * once, up front -- see the struct value_attr comment and this
+	 * file's header comment on the uintN/double scope limit. */
+	struct value_attr value_attrs[DS_MAX_ATTRS];
+	size_t n_value_attrs = 0;
+	size_t ai;
+	for (ai = 0; ai < ds.n_attrs; ai++) {
+		const ds_attr_t *da = &ds.attrs[ai];
+		if (da->is_identity)
+			continue;
+		if (da->family != DS_FAMILY_UINT && da->family != DS_FAMILY_DOUBLE) {
+			fprintf(stderr,
+				"error: attribute '%s' has type '%s', which this SOS "
+				"writer does not support (only uintN and double are, "
+				"today); see this file's header comment\n",
+				da->name, da->type_str);
+			return 1;
+		}
+		value_attrs[n_value_attrs].sos_attr = must_attr(schema, da->name);
+		value_attrs[n_value_attrs].idx = ai;
+		value_attrs[n_value_attrs].family = da->family;
+		n_value_attrs++;
+	}
 
 	uint64_t base = (uint64_t)(o.node_index + 1) * 1000;
 	uint64_t written = 0, in_batch = 0, errors = 0;
@@ -308,17 +387,27 @@ int main(int argc, char **argv)
 	for (seq = 0; seq < o.samples; seq++) {
 		for (c = 0; c < o.components; c++) {
 			uint64_t comp = base + c;
+			ds_value_t values[DS_MAX_ATTRS];
+			size_t vi;
+
+			ds_expected(&ds, comp, seq, values);
+
 			sos_obj_t obj = sos_obj_new(schema);
 			if (!obj) {
 				fprintf(stderr, "error %d allocating object\n", errno);
 				return 1;
 			}
-			set_ts(obj, a_ts, o.t0 + seq * o.interval);
-			set_u64(obj, a_comp, comp);
-			set_u64(obj, a_job, 1 + seq / o.job_len);
-			set_u64(obj, a_seq, seq);
-			set_u64(obj, a_mem, comp * 1000000 + seq);
-			set_double(obj, a_load, (double)(comp % 1000) + seq * 0.25);
+			set_ts(obj, a_ts, values[idx_ts].u64);
+			set_u64(obj, a_comp, values[idx_comp].u64);
+			set_u64(obj, a_job, values[idx_job].u64);
+			set_u64(obj, a_seq, values[idx_seq].u64);
+			for (vi = 0; vi < n_value_attrs; vi++) {
+				const struct value_attr *va = &value_attrs[vi];
+				if (va->family == DS_FAMILY_UINT)
+					set_u64(obj, va->sos_attr, values[va->idx].u64);
+				else
+					set_double(obj, va->sos_attr, values[va->idx].d);
+			}
 			rc = sos_obj_index(obj);
 			sos_obj_put(obj);
 			if (rc) {
@@ -362,5 +451,6 @@ int main(int argc, char **argv)
 	       o.path, o.backend, o.node_index, written, errors, o.batch, o.rate,
 	       t_write - t_start, t_indexed - t_write, t_end - t_indexed,
 	       t_end - t_start, written / (t_end - t_write));
+	ds_free(&ds);
 	return errors ? 1 : 0;
 }

@@ -10,12 +10,22 @@ The container ends up on the local server, stored by dsosd under the
 path configured in its directory file.  Because dsosd owns the container,
 the schema must be added through the session, not by opening the
 container directly.
+
+Produces the data set defined by the DATASET env var (see
+core/dataset.py): the value rules are not duplicated here, this writer
+imports core/dataset.py and calls Dataset.expected() for every record,
+the same as sos_write.py and sos_write.c, so that containers written by
+any of the three answer every query identically.
 """
 import argparse
 import json
 import os
 import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "..", "core"))
+from dataset import Dataset              # noqa: E402
 
 
 def parse_args():
@@ -45,6 +55,15 @@ def main():
     with open(a.template) as f:
         template = json.load(f)
 
+    # The authoritative attribute list and types come from the dataset
+    # definition (DATASET env var -- the same file bench.py and
+    # core/dataset.py meta use), not from the SOS schema template: the
+    # template only needs to have a same-named, same-typed attribute for
+    # each one. This is what lets a new dataset need no change here.
+    ds = Dataset(Dataset.load_definition(os.environ["DATASET"]),
+                partitions=1, components=a.components, samples=a.samples,
+                t0=a.t0, interval=a.interval, job_len=a.job_len)
+
     t_start = time.monotonic()
 
     # Connect to the local dsosd through the session file.
@@ -58,15 +77,7 @@ def main():
         schema.add(cont)
         schema = cont.schema_by_name(template["name"])
 
-    ids = {n: schema.attr_by_name(n).attr_id()
-           for n in ("timestamp", "component_id", "job_id", "seq",
-                     "mem_free", "load")}
-    i_ts   = ids["timestamp"]
-    i_comp = ids["component_id"]
-    i_job  = ids["job_id"]
-    i_seq  = ids["seq"]
-    i_mem  = ids["mem_free"]
-    i_load = ids["load"]
+    attr_ids = {n: schema.attr_by_name(n).attr_id() for n in ds.attr_names}
 
     base = (a.node_index + 1) * 1000
     written = errors = in_batch = 0
@@ -74,17 +85,19 @@ def main():
 
     cont.begin()
     for seq in range(a.samples):
-        ts = (a.t0 + seq * a.interval, 0)
-        job = 1 + seq // a.job_len
         for c in range(a.components):
             comp = base + c
+            values = ds.expected(comp, seq)
             obj = schema.alloc()
-            obj[i_ts]   = ts
-            obj[i_comp] = comp
-            obj[i_job]  = job
-            obj[i_seq]  = seq
-            obj[i_mem]  = comp * 1000000 + seq
-            obj[i_load] = float(comp % 1000) + seq * 0.25
+            for name in ds.attr_names:
+                aid = attr_ids[name]
+                v = values[name]
+                if name == "timestamp":
+                    obj[aid] = (int(v), 0)
+                elif ds.attr_type(name) == "double":
+                    obj[aid] = float(v)
+                else:
+                    obj[aid] = int(v)
             rc = obj.index_add()
             obj.release()
             if rc:
