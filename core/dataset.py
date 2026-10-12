@@ -34,10 +34,13 @@ debugging) and, for the verifier's narrower needs, expected_count() and
 expected_component_attr() (Sec 6.5's expected_count()/evaluate(attr, C_i),
 recomputed directly without generating a kind's whole sample).
 core/bench.py's verifier implements Sec 6.5's condition grammar
-(kind[i].attr / kind[*].attr / count(kind)) against these. What it does
-not yet do is validate component-level attribute *values* inside an
-already-returned row -- there is no backend schema mapping for component
-kinds yet (Sec 6.5's backend-mapping table; Stage 5 in STATUS.md).
+(kind[i].attr / kind[*].attr / count(kind)) against these, used to filter
+the expected *node* row set a query should return. What it does not do is
+validate a component kind's own attribute *values* against an
+already-returned row, since no backend returns component-kind attributes
+as part of a node row -- see each backend's README.md for how it maps a
+component kind onto its own schema/measurement instead (Sec 6.5's
+backend-mapping table; Stage 5 in STATUS.md).
 
 Every writer, in any backend, must produce exactly these values; the
 query engine verifies answers against them.

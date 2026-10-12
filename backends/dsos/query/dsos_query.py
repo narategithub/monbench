@@ -7,12 +7,48 @@
           include that start-up; useful as a cross-check only.
 
 Settings (backends/dsos/dsos_backend.conf): SOS_ROW_LIMIT, DSOSQL.
+
+Component-kind queries (design/value-generation.md Sec 6.5): see
+backends/sos/query/sos_query.py's module docstring -- both adapters here
+share the same "dsos" dialect and SOS query language, so the same native
+query text (select straight from the per-kind schema "{schema}_<kind>",
+no JOIN) and the same postprocess()-based dedup for the kind[*]
+existential form apply unchanged. count(kind) is likewise not yet
+natively queryable here (STATUS.md).
 """
 import os
 import re
 import subprocess
 
 from adapter import Adapter, BackendError
+
+# Matches the table name in "... from <name> ...", case-insensitively --
+# see backends/sos/query/sos_query.py's _dedup_component_rows() docstring,
+# which this mirrors for the dsos/dsosql adapters.
+_FROM_RE = re.compile(r"\bfrom\s+(\S+)", re.IGNORECASE)
+_IDENTITY_COLS = ("component_id", "job_id", "seq")
+
+
+def _dedup_component_rows(ctx, text, columns, rows):
+    """Identical to sos_query.py's helper of the same name -- duplicated
+    rather than shared, consistent with every backend's query adapter
+    being a single self-contained file loaded by path (core/bench.py's
+    load_plugin()); see that file's docstring for the full rationale."""
+    m = _FROM_RE.search(text)
+    if not m or m.group(1) == ctx["schema"]:
+        return rows
+    keys_present = [c for c in _IDENTITY_COLS if c in columns]
+    if not keys_present:
+        return rows
+    seen = set()
+    out = []
+    for r in rows:
+        key = tuple(r.get(c) for c in keys_present)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 def _session_file(ctx):
@@ -64,6 +100,9 @@ class DsosAdapter(Adapter):
 
     def records(self, df):
         return list(df.columns), df.to_dict("records")
+
+    def postprocess(self, text, columns, rows):
+        return _dedup_component_rows(self.ctx, text, columns, rows)
 
     def close(self):
         self.cont = None
@@ -117,6 +156,9 @@ class DsosqlAdapter(Adapter):
 
     def records(self, rows):
         return self._columns, rows
+
+    def postprocess(self, text, columns, rows):
+        return _dedup_component_rows(self.ctx, text, columns, rows)
 
 
 ADAPTERS = {a.name: a for a in (DsosAdapter, DsosqlAdapter)}

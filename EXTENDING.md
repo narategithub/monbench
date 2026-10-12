@@ -110,6 +110,7 @@ Each adapter subclass must implement these methods:
 | `query(text)` | Yes | Run one query and yield its result in batches |
 | `count(batch)` | Yes | Return the number of rows in a batch. Default: `len(batch)` |
 | `records(batch)` | No | Return `(columns, rows)` where rows are dicts keyed by attribute name. Used for verification only |
+| `postprocess(text, columns, rows)` | No | Optional. Backend-specific shaping of a query's full, assembled result (after `records()` and column-map reversal), for verification only. Default: no-op (`return rows`). See `core/adapter.py`'s docstring and `backends/sos/query/sos_query.py` for a concrete use: collapsing a component-kind query's possible multiple rows per node sample into one, since the SOS/DSOS query language has no JOIN/DISTINCT to do it in the query text itself |
 | `close()` | No | Release the connection |
 
 The engine times each run from the call to `query()` until the last batch has been counted. Do only what a normal client of the backend would do inside `query()`, so timings stay comparable.
@@ -316,16 +317,26 @@ backend's query language:
 Component conditions describe the question in backend-neutral terms for
 verification; a backend also needs its own native query against however it
 stores that component kind to actually answer the question (the backend
-mapping in `design/value-generation.md` Sec 6.5). **The InfluxDB backend
-now has this**: a component kind is written to its own measurement
-(`backends/influxdb/README.md`'s "Component-kind data model mapping"), and a
-native SQL query joins it back to the node measurement on `(component_id,
-timestamp)` to answer `kind[i].attr`/`kind[*].attr`/`count(kind)` — see
+mapping in `design/value-generation.md` Sec 6.5). **InfluxDB, SOS and DSOS
+all have this now**: a component kind is written to its own measurement
+or schema (`backends/influxdb/README.md`'s and `backends/sos/README.md`'s
+"Component-kind data model mapping" sections), and a native query answers
+`kind[i].attr`/`kind[*].attr` against it — InfluxDB with a SQL join back to
+the node measurement on `(component_id, timestamp)`; SOS/DSOS (whose query
+language has no JOIN) by selecting straight from the per-kind schema, with
+the existential `kind[*].attr` form's possible multiple-rows-per-sample
+collapsed by the query engine's `Adapter.postprocess()` hook (`core/
+adapter.py`) rather than in the query text — see
 `queries/curated_metrics.json` for worked examples against
-`dataset/curated_metrics_like.json`. SOS and DSOS do not yet map component
-kinds onto their own schemas, so a `match.where` using this grammar has no
-native query string for those adapters yet and reports SKIP (see
-`STATUS.md`).
+`dataset/curated_metrics_like.json`, each with `"influxdb"` and `"dsos"`
+query strings. `count(kind)` is native only on InfluxDB: SOS's query
+language has no `GROUP BY`/`HAVING`-style count filter, so that one
+condition form still has no native query string for the `sos`/`dsos`
+adapters and reports SKIP (see `STATUS.md`). Every component-kind
+attribute type maps onto a real SOS schema type (`backends/sos/
+make_schema.py`'s `sos_attr()`): `string` becomes a fixed-length
+CHAR_ARRAY and `uint8`/`int8` widen to the closest wider SOS integer
+type SOS has (`UINT16`/`INT16`) — nothing is dropped from the schema.
 
 Backend-specific choices — which index to use, SQL syntax differences,
 function calls — belong in the query string only, not in `match`.

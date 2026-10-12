@@ -19,10 +19,70 @@ node — typically the shared-filesystem prefix without ${HOSTNAME}.
 Settings (from sos_backend.conf / environment):
     SOS_DATA_ROOT   root of the containers
     SOS_ROW_LIMIT   rows per batch (default 4096)
+
+Component-kind queries (design/value-generation.md Sec 6.5): a component
+kind is written to its own schema named "{schema}_<kind>" (see
+backends/sos/README.md's "Component-kind data model mapping" and
+backends/sos/writer/sos_write.py/.c). The SOS query language has no
+JOIN/DISTINCT, so a native kind[i].attr / kind[*].attr query selects
+directly from that per-kind schema -- e.g.
+"select component_id, job_id, seq, timestamp from {schema}_cpu where
+idle < 50 order_by timestamp" -- rather than joining it back to the node
+schema in the query text itself. That alone answers kind[i].attr (each
+instance is already unique per node sample). kind[*].attr (existential)
+can return more than one row per node sample when more than one instance
+matches; postprocess() below collapses those into one, the same effect
+InfluxDB's native SQL gets from SELECT DISTINCT over its join. See
+queries/curated_metrics.json's "dsos" entries for worked examples.
+count(kind) has no native query here yet -- SOS's language has no
+GROUP BY/HAVING-style count filter either, so a count(kind) condition
+still reports SKIP for this adapter (see STATUS.md).
 """
 import os
+import re
 
 from adapter import Adapter, BackendError
+
+# Matches the table name in "... from <name> ...", case-insensitively, the
+# only part of a SOS query string postprocess() needs to read.
+_FROM_RE = re.compile(r"\bfrom\s+(\S+)", re.IGNORECASE)
+# Columns identifying one node sample, checked in this order for presence.
+_IDENTITY_COLS = ("component_id", "job_id", "seq")
+
+
+def _dedup_component_rows(ctx, text, columns, rows):
+    """Collapse duplicate node-sample rows from a component-kind query.
+
+    A query against a per-kind schema (see module docstring) can return
+    more than one row for the same node sample -- one per matching
+    instance -- when it has no 'component_index' filter (the kind[*]
+    existential form). Collapse rows that agree on every identity column
+    present, keeping the first, the same effect InfluxDB's native
+    "SELECT DISTINCT ... JOIN ..." gets (backends/influxdb/README.md).
+
+    A no-op for an ordinary query against the node schema itself (the
+    common case): detected generically by comparing the query's own FROM
+    target to ctx['schema'], so this never needs to know which kinds a
+    dataset declares. Also a no-op if no identity column is selected, or
+    if the query names no FROM target this regex understands (e.g. the
+    exploratory 'group by job' aggregate query) -- never raises on text
+    it doesn't recognise.
+    """
+    m = _FROM_RE.search(text)
+    if not m or m.group(1) == ctx["schema"]:
+        return rows
+    keys_present = [c for c in _IDENTITY_COLS if c in columns]
+    if not keys_present:
+        return rows
+    seen = set()
+    out = []
+    for r in rows:
+        key = tuple(r.get(c) for c in keys_present)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 def _probe(ctx):
@@ -91,6 +151,9 @@ class SosAdapter(Adapter):
 
     def records(self, df):
         return list(df.columns), df.to_dict("records")
+
+    def postprocess(self, text, columns, rows):
+        return _dedup_component_rows(self.ctx, text, columns, rows)
 
     def close(self):
         for cont in self._containers:

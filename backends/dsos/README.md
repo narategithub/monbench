@@ -12,6 +12,7 @@ own partition, and the client merges the results in index order.
 | Query | Yes, across all servers through `dsosd` |
 | Reads data written by | `sos`, `dsos` (declared in `PLUGIN_READS`) |
 | Service | `dsosd` on each server node; started in `serve-write` and stopped in `stop` |
+| Component kinds (design/value-generation.md Sec 6) | Yes, same mapping as the `sos` backend -- see `backends/sos/README.md`'s "Component-kind data model mapping" |
 
 The DSOS writer stores data in the same SOS container format as the `sos`
 backend, so data written by either backend can be queried by either.
@@ -33,7 +34,11 @@ Two adapters, selected with `QUERY_ADAPTER` (empty selects the default):
 | `dsosql` | the `dsosql` command, CSV output parsed | starts a `dsosql` process per query | cross-checking results; its timings include process start-up and connecting, so not for performance comparison |
 
 Both speak the same query language (dialect `dsos`), so they share the query
-strings in a query set.
+strings in a query set -- including the component-kind `kind[i].attr`/
+`kind[*].attr` query strings, since `dsos_write.py` writes the same
+per-kind schemas the `sos` writers do (see `backends/sos/README.md`'s
+"Component-kind data model mapping"; `count(kind)` is not natively
+queryable here either, for the same reason).
 
 ## Configuration
 

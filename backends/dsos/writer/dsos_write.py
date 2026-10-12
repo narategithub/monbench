@@ -16,6 +16,17 @@ core/dataset.py): the value rules are not duplicated here, this writer
 imports core/dataset.py and calls Dataset.expected() for every record,
 the same as sos_write.py and sos_write.c, so that containers written by
 any of the three answer every query identically.
+
+If the dataset declares component kinds (design/value-generation.md Sec
+6), each kind's instances are also written through the same dsosd
+session, one schema per kind -- see sos_write.py's KindWriter (mirrored
+here) and backends/sos/README.md's "Component-kind data model mapping".
+Every attribute type maps onto a real SOS schema type
+(backends/sos/make_schema.py's sos_attr()): a string attribute is
+written as the fixed-length CHAR_ARRAY the template declares, and an
+unsigned 8/16/32/64-bit attribute is written as a plain Python int into
+whichever widened SOS integer attribute the template created for it --
+nothing is dropped.
 """
 import argparse
 import json
@@ -48,6 +59,53 @@ def parse_args():
     return p.parse_args()
 
 
+def get_schema(cont, tmpl, Sos):
+    schema = cont.schema_by_name(tmpl["name"])
+    if schema is None:
+        schema = Sos.Schema()
+        schema.from_template(tmpl)
+        schema.add(cont)
+        schema = cont.schema_by_name(tmpl["name"])
+    return schema
+
+
+class KindWriter:
+    """Mirrors sos_write.py's KindWriter -- one component kind's schema
+    plus the attr-name -> attr-id map needed to write an instance.
+    *attr_names* is the kind's declared attributes that the per-kind
+    template has a same-named SOS attribute for (every one of them, in
+    practice -- see make_schema.py's sos_attr())."""
+    def __init__(self, cont, tmpl, ds, kind, Sos):
+        self.schema = get_schema(cont, tmpl, Sos)
+        self.attr_ids = {n: self.schema.attr_by_name(n).attr_id()
+                         for n in ("timestamp", "component_id", "job_id",
+                                   "seq", "component_index")}
+        self.attr_names = [a["name"] for a in ds.component_kind(kind)["attributes"]
+                           if self.schema.attr_by_name(a["name"]) is not None]
+        for n in self.attr_names:
+            self.attr_ids[n] = self.schema.attr_by_name(n).attr_id()
+
+    def write(self, comp, job_id, seq, ts, rec, ds, kind):
+        obj = self.schema.alloc()
+        obj[self.attr_ids["timestamp"]] = (int(ts), 0)
+        obj[self.attr_ids["component_id"]] = int(comp)
+        obj[self.attr_ids["job_id"]] = int(job_id)
+        obj[self.attr_ids["seq"]] = int(seq)
+        obj[self.attr_ids["component_index"]] = int(rec["index"])
+        for name in self.attr_names:
+            v = rec[name]
+            t = ds.component_attr_type(kind, name)
+            if t == "double":
+                obj[self.attr_ids[name]] = float(v)
+            elif t == "string":
+                obj[self.attr_ids[name]] = str(v)
+            else:
+                obj[self.attr_ids[name]] = int(v)
+        rc = obj.index_add()
+        obj.release()
+        return rc
+
+
 def main():
     a = parse_args()
     from sosdb import Sos
@@ -70,14 +128,10 @@ def main():
     session = Sos.Session(a.session)
     cont = session.open(a.target, o_perm=Sos.PERM_RW)
 
-    schema = cont.schema_by_name(template["name"])
-    if schema is None:
-        schema = Sos.Schema()
-        schema.from_template(template)
-        schema.add(cont)
-        schema = cont.schema_by_name(template["name"])
-
+    schema = get_schema(cont, template["node"], Sos)
     attr_ids = {n: schema.attr_by_name(n).attr_id() for n in ds.attr_names}
+    kind_writers = {kind: KindWriter(cont, template["components"][kind], ds, kind, Sos)
+                    for kind in template["components"]}
 
     base = (a.node_index + 1) * 1000
     written = errors = in_batch = 0
@@ -96,6 +150,8 @@ def main():
                     obj[aid] = (int(v), 0)
                 elif ds.attr_type(name) == "double":
                     obj[aid] = float(v)
+                elif ds.attr_type(name) == "string":
+                    obj[aid] = str(v)
                 else:
                     obj[aid] = int(v)
             rc = obj.index_add()
@@ -106,6 +162,15 @@ def main():
                     print(f"error {rc} indexing record {written}",
                           file=sys.stderr)
             written += 1
+            for rec in ds.expected_components(comp, seq):
+                rc = kind_writers[rec["kind"]].write(
+                    comp, values["job_id"], seq, values["timestamp"],
+                    rec, ds, rec["kind"])
+                if rc:
+                    errors += 1
+                    if errors <= 10:
+                        print(f"error {rc} indexing {rec['kind']}[{rec['index']}] "
+                              f"for record {written}", file=sys.stderr)
             in_batch += 1
             if in_batch == a.batch:
                 cont.commit()

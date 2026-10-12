@@ -478,14 +478,18 @@ def collect(adapter, text):
     The caller is responsible for applying the column map to *text*
     before calling this function.  Result columns are renamed back to
     dataset attribute names here so the verifier always sees dataset
-    names.
+    names. adapter.postprocess() then gets a chance to do any further,
+    backend-specific shaping of the full result (see Adapter.postprocess's
+    docstring in core/adapter.py) -- a no-op for most backends.
     """
     columns, rows = [], []
     for batch in adapter.query(text):
         cols, recs = adapter.records(batch)
         columns = columns or cols
         rows.extend(recs)
-    return _reverse_column_map(columns, rows, adapter._column_map)
+    columns, rows = _reverse_column_map(columns, rows, adapter._column_map)
+    rows = adapter.postprocess(text, columns, rows)
+    return columns, rows
 
 
 def timed_run(adapter, text):

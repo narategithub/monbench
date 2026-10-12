@@ -25,14 +25,28 @@
  * other writer) produces the same records by calling the same shared
  * layer, in their language's form of it.
  *
- * Scope note: today's dataset JSON files only declare uintN and double
- * attributes outside the identity ones, and this writer only supports
- * those two families -- the same scope the writer has always had (it
- * previously hardcoded exactly uint64/double metrics). A dataset
- * attribute of another family (int, string) is rejected with an error
- * rather than silently mishandled; SOS's own type_map below also has no
- * entry for UINT8/INT8/STRING, a separate, pre-existing backend
- * limitation this writer does not attempt to paper over.
+ * Scope note: this writer now supports every dataset attribute family --
+ * uintN (any width), intN (any width, including int8), double and
+ * timestamp are written directly, and string is written as a
+ * fixed-length SOS CHAR_ARRAY (see backends/sos/make_schema.py's
+ * sos_attr(), which maps every dataset-JSON type onto a real SOS schema
+ * type: uint8/int8 widen to the closest wider SOS integer type SOS has,
+ * UINT16/INT16, and string becomes CHAR_ARRAY). set_value() below
+ * dispatches a value to the right SOS setter by the attribute's resolved
+ * family and exact type_str -- int8/int16 share set_i16() (both widen to
+ * a SOS INT16, same as uint8/uint16 share set_u16() for UINT16), int32
+ * uses set_i32(), int64 uses set_i64(). The union member names
+ * (prim.int16_/int32_/int64_) are confirmed against a real sos.h (see
+ * sos_value_s's sos_primary_u) -- unlike the CHAR_ARRAY path below, which
+ * is still a best-effort guess.
+ *
+ * If the dataset declares component kinds (design/value-generation.md
+ * Sec 6), each kind's instances are also written, one schema per kind --
+ * see struct kind_writer below and backends/sos/README.md's
+ * "Component-kind data model mapping". The scope above applies per kind
+ * too: build_kind_writer() now writes a kind's signed-integer attributes
+ * the same way the flat loop does, through the same set_value()
+ * dispatcher, so no kind attribute is skipped any more.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -50,6 +64,12 @@
 #include "dataset.h"
 
 #define MAX_JOIN_ATTRS 16
+/* Max component instances a single (comp, seq) sample can produce, across
+ * every declared kind -- see write_component()'s caller in main(). Every
+ * dataset JSON seen so far declares at most a handful per kind
+ * (dataset/curated_metrics_like.json: 2 cpu + up to 4 netdev); this is
+ * comfortably larger, with room for a kind declaring a wider count range. */
+#define MAX_COMPONENT_RECS 256
 
 struct opts {
 	const char *path;
@@ -92,6 +112,14 @@ static const struct {
 	{ "UINT32", SOS_TYPE_UINT32 },	 { "UINT64", SOS_TYPE_UINT64 },
 	{ "FLOAT", SOS_TYPE_FLOAT },	 { "DOUBLE", SOS_TYPE_DOUBLE },
 	{ "TIMESTAMP", SOS_TYPE_TIMESTAMP }, { "JOIN", SOS_TYPE_JOIN },
+	/* A string attribute (backends/sos/make_schema.py's sos_attr())
+	 * becomes a fixed-length character array -- the template's "size"
+	 * field (schema_from_template_obj() below) gives its length. Not
+	 * built/tested against a real sos.h in this sandbox; confirm
+	 * SOS_TYPE_CHAR_ARRAY is the right constant (and that
+	 * sos_schema_attr_add()'s size argument means "number of
+	 * characters" for it) before trusting this against a real install. */
+	{ "CHAR_ARRAY", SOS_TYPE_CHAR_ARRAY },
 };
 
 static int lookup_type(const char *name, sos_type_t *type)
@@ -107,26 +135,27 @@ static int lookup_type(const char *name, sos_type_t *type)
 }
 
 /*
- * Build a schema from the same JSON template the Python Schema.from_template()
- * method accepts, so that both writers produce an identical schema. This
- * part is unrelated to value generation (it only maps the template's own
+ * Build a schema from one already-parsed template object (the same shape
+ * the Python Schema.from_template() method accepts: {"name", "uuid",
+ * "attrs"}), so that both writers produce an identical schema. This part
+ * is unrelated to value generation (it only maps the template's own
  * declared attribute types onto SOS's), so it is unchanged by the move
  * to core/dataset.c below.
+ *
+ * Takes an already-parsed json_t* rather than loading its own file,
+ * because the template file now holds more than one such object --
+ * {"node": {...}, "components": {"<kind>": {...}, ...}} (see
+ * backends/sos/make_schema.py) -- loaded once by main() into a single
+ * json_t* tree that this function's caller slices up.
  */
-static sos_schema_t schema_from_template(const char *path)
+static sos_schema_t schema_from_template_obj(json_t *tmpl)
 {
-	json_error_t jerr;
-	json_t *tmpl, *attrs, *attr;
+	json_t *attrs, *attr;
 	size_t i;
 	uuid_t uuid;
 	sos_schema_t schema = NULL;
 	int rc;
 
-	tmpl = json_load_file(path, 0, &jerr);
-	if (!tmpl) {
-		fprintf(stderr, "error: %s:%d: %s\n", path, jerr.line, jerr.text);
-		return NULL;
-	}
 	const char *name = json_string_value(json_object_get(tmpl, "name"));
 	const char *uuid_str = json_string_value(json_object_get(tmpl, "uuid"));
 	attrs = json_object_get(tmpl, "attrs");
@@ -164,7 +193,13 @@ static sos_schema_t schema_from_template(const char *path)
 				join_list[j] = (char *)json_string_value(json_array_get(jattrs, j));
 			rc = sos_schema_attr_add(schema, aname, type, count, join_list);
 		} else {
-			rc = sos_schema_attr_add(schema, aname, type, (size_t)0);
+			/* "size" is set for a CHAR_ARRAY attribute (a string's
+			 * fixed length -- backends/sos/make_schema.py's
+			 * sos_attr()); every other type ignores it and takes
+			 * the previous, unsized form. */
+			json_t *size_j = json_object_get(attr, "size");
+			size_t size = size_j ? (size_t)json_integer_value(size_j) : 0;
+			rc = sos_schema_attr_add(schema, aname, type, size);
 		}
 		if (rc) {
 			fprintf(stderr, "error %d adding attribute '%s'\n", rc, aname);
@@ -191,36 +226,62 @@ err:
 	sos_schema_free(schema);
 	schema = NULL;
 out:
-	json_decref(tmpl);
+	/* tmpl is owned by the caller (it is a slice of main()'s single
+	 * parsed template tree) -- unlike the old schema_from_template(path)
+	 * this replaces, this function does not decref it. */
 	return schema;
 }
 
-static sos_schema_t get_schema(sos_t sos, const char *template_path)
+/* Get or create, in *sos*, the schema described by the already-parsed
+ * template object *tmpl* ({"name", "uuid", "attrs"}) -- used for both the
+ * node schema (tmpl = root["node"]) and each component kind's schema
+ * (tmpl = root["components"][kind]). */
+static sos_schema_t get_schema_obj(sos_t sos, json_t *tmpl)
 {
-	json_error_t jerr;
-	json_t *tmpl = json_load_file(template_path, 0, &jerr);
-	if (!tmpl) {
-		fprintf(stderr, "error: %s:%d: %s\n", template_path, jerr.line, jerr.text);
+	const char *name = json_string_value(json_object_get(tmpl, "name"));
+	if (!name) {
+		fprintf(stderr, "error: template missing 'name'\n");
 		return NULL;
 	}
-	char *name = strdup(json_string_value(json_object_get(tmpl, "name")));
-	json_decref(tmpl);
-
 	sos_schema_t schema = sos_schema_by_name(sos, name);
 	if (!schema) {
-		sos_schema_t new_schema = schema_from_template(template_path);
+		sos_schema_t new_schema = schema_from_template_obj(tmpl);
 		if (!new_schema)
-			goto out;
+			return NULL;
 		int rc = sos_schema_add(sos, new_schema);
 		if (rc) {
 			fprintf(stderr, "error %d adding schema '%s'\n", rc, name);
-			goto out;
+			return NULL;
 		}
 		schema = sos_schema_by_name(sos, name);
 	}
-out:
-	free(name);
 	return schema;
+}
+
+/* set_u16/set_u32/set_u64 each write to the union member sized to match
+ * the SOS attribute's own declared width -- required because an object's
+ * on-disk/in-memory layout allocates exactly that attribute's declared
+ * size (e.g. 2 bytes for a UINT16), so writing the wider prim.uint64_
+ * member for anything narrower than 8 bytes would write past the
+ * attribute's storage into whatever follows it in the object. Dataset
+ * uint8/uint16 attributes both become a SOS UINT16 (make_schema.py's
+ * sos_attr() -- SOS has no UINT8), so both use set_u16; uint32 uses
+ * set_u32; uint64 uses set_u64. See set_value() below, which picks the
+ * matching one by the attribute's type_str. */
+static inline void set_u16(sos_obj_t obj, sos_attr_t attr, uint16_t v)
+{
+	struct sos_value_s v_;
+	sos_value_t val = sos_value_init(&v_, obj, attr);
+	val->data->prim.uint16_ = v;
+	sos_value_put(val);
+}
+
+static inline void set_u32(sos_obj_t obj, sos_attr_t attr, uint32_t v)
+{
+	struct sos_value_s v_;
+	sos_value_t val = sos_value_init(&v_, obj, attr);
+	val->data->prim.uint32_ = v;
+	sos_value_put(val);
 }
 
 static inline void set_u64(sos_obj_t obj, sos_attr_t attr, uint64_t v)
@@ -228,6 +289,37 @@ static inline void set_u64(sos_obj_t obj, sos_attr_t attr, uint64_t v)
 	struct sos_value_s v_;
 	sos_value_t val = sos_value_init(&v_, obj, attr);
 	val->data->prim.uint64_ = v;
+	sos_value_put(val);
+}
+
+/* set_i16/set_i32/set_i64 are the signed analogs of set_u16/set_u32/
+ * set_u64 above, same width-matching rationale: a dataset int8/int16
+ * attribute becomes a SOS INT16 (make_schema.py's sos_attr() -- SOS has
+ * no INT8 either), so both share set_i16; int32 uses set_i32; int64 uses
+ * set_i64. sos_primary_u's int16_/int32_/int64_ member names are
+ * confirmed against a real sos.h (unlike set_char_array() below, which
+ * is still unverified). */
+static inline void set_i16(sos_obj_t obj, sos_attr_t attr, int16_t v)
+{
+	struct sos_value_s v_;
+	sos_value_t val = sos_value_init(&v_, obj, attr);
+	val->data->prim.int16_ = v;
+	sos_value_put(val);
+}
+
+static inline void set_i32(sos_obj_t obj, sos_attr_t attr, int32_t v)
+{
+	struct sos_value_s v_;
+	sos_value_t val = sos_value_init(&v_, obj, attr);
+	val->data->prim.int32_ = v;
+	sos_value_put(val);
+}
+
+static inline void set_i64(sos_obj_t obj, sos_attr_t attr, int64_t v)
+{
+	struct sos_value_s v_;
+	sos_value_t val = sos_value_init(&v_, obj, attr);
+	val->data->prim.int64_ = v;
 	sos_value_put(val);
 }
 
@@ -248,6 +340,26 @@ static inline void set_ts(sos_obj_t obj, sos_attr_t attr, uint64_t secs)
 	sos_value_put(val);
 }
 
+/* Write a NUL-terminated string into a fixed-length CHAR_ARRAY attribute
+ * (backends/sos/make_schema.py's sos_attr() "size" field gave it exactly
+ * *len* characters, matching the attribute's declared "length" -- the
+ * same len ds_attr_t.length carries, so the two always agree). Not
+ * built/tested against a real sos.h (see the CHAR_ARRAY type_map entry's
+ * comment); sos_value_init() on an array-typed attribute is assumed to
+ * size *val->data* for the attribute's declared array length, with
+ * data->array.data.char_ the character buffer and data->array.count the
+ * length to store, mirroring the prim.* pattern the scalar setters above
+ * use -- confirm both against the real SOS header before trusting this. */
+static inline void set_char_array(sos_obj_t obj, sos_attr_t attr,
+                                   const char *s, size_t len)
+{
+	struct sos_value_s v_;
+	sos_value_t val = sos_value_init(&v_, obj, attr);
+	val->data->array.count = (uint32_t)len;
+	memcpy(val->data->array.data.char_, s, len);
+	sos_value_put(val);
+}
+
 static sos_attr_t must_attr(sos_schema_t schema, const char *name)
 {
 	sos_attr_t attr = sos_schema_attr_by_name(schema, name);
@@ -260,12 +372,131 @@ static sos_attr_t must_attr(sos_schema_t schema, const char *name)
 
 /* One non-identity dataset attribute, resolved to both its SOS attr
  * handle and the index ds_expected() will fill its value at -- built
- * once from the loaded dataset_t, used by every record. */
+ * once from the loaded dataset_t, used by every record. *attr* is kept
+ * (rather than just its family, as before) so set_value() can dispatch
+ * on its exact type_str too -- needed to tell a SOS-UINT16-via-uint8
+ * attribute from a SOS-UINT16-via-uint16 one, a SOS-INT16-via-int8 from
+ * a SOS-INT16-via-int16, etc. */
 struct value_attr {
 	sos_attr_t sos_attr;
 	size_t idx;		/* index into dataset_t.attrs[] / ds_expected()'s values[] */
-	ds_family_t family;
+	const ds_attr_t *attr;
 };
+
+/* Write one resolved value attribute's value, dispatching on *da*'s
+ * family and (for DS_FAMILY_UINT/DS_FAMILY_INT) exact declared width --
+ * the single place both the flat write loop and write_component() go
+ * through, so the two can never diverge on how a given family/width is
+ * written. Only ever called for a UINT/INT/DOUBLE/STRING attribute (see
+ * the flat resolution loop in main() and build_kind_writer(), which are
+ * what decide which families get a value_attr at all; DS_FAMILY_TIMESTAMP
+ * never does, since the identity timestamp attribute is written directly
+ * via set_ts(), not through this dispatcher). */
+static void set_value(sos_obj_t obj, const ds_attr_t *da, sos_attr_t sa,
+                       const ds_value_t *v)
+{
+	switch (da->family) {
+	case DS_FAMILY_UINT:
+		if (strcasecmp(da->type_str, "uint32") == 0)
+			set_u32(obj, sa, (uint32_t)v->u64);
+		else if (strcasecmp(da->type_str, "uint64") == 0)
+			set_u64(obj, sa, v->u64);
+		else	/* uint8 or uint16: both map to a SOS UINT16 */
+			set_u16(obj, sa, (uint16_t)v->u64);
+		break;
+	case DS_FAMILY_INT:
+		if (strcasecmp(da->type_str, "int32") == 0)
+			set_i32(obj, sa, (int32_t)v->i64);
+		else if (strcasecmp(da->type_str, "int64") == 0)
+			set_i64(obj, sa, v->i64);
+		else	/* int8 or int16: both map to a SOS INT16 */
+			set_i16(obj, sa, (int16_t)v->i64);
+		break;
+	case DS_FAMILY_DOUBLE:
+		set_double(obj, sa, v->d);
+		break;
+	case DS_FAMILY_STRING:
+		set_char_array(obj, sa, v->str, da->length);
+		break;
+	case DS_FAMILY_TIMESTAMP:
+		/* Unreachable: never resolved into a value_attr (see this
+		 * function's doc comment). */
+		break;
+	}
+}
+
+/* One component kind's schema plus everything needed to write one
+ * instance of it, built once from the loaded dataset_t and the matching
+ * slice of the parsed template tree -- the per-kind analog of the flat
+ * schema/value_attrs[] pair above. value_attrs here indexes into a
+ * ds_component_rec_t's values[] (kind->attrs order), not dataset_t.attrs[]. */
+struct kind_writer {
+	sos_schema_t schema;
+	sos_attr_t a_ts, a_comp, a_job, a_seq, a_idx;
+	struct value_attr value_attrs[DS_MAX_ATTRS];
+	size_t n_value_attrs;
+};
+
+/* Resolve one component kind's schema and value attrs. *kind_tmpl* is
+ * root["components"][kind->kind] from main()'s parsed template tree --
+ * built by backends/sos/make_schema.py's convert_kind(), which gives
+ * every attribute a real SOS type, signed integers included. Every kind
+ * attribute gets a value_attr here and is written through set_value(),
+ * the same dispatcher the flat loop uses. */
+static int build_kind_writer(sos_t sos, json_t *kind_tmpl, const ds_kind_t *kind,
+                              struct kind_writer *kw)
+{
+	size_t ai;
+
+	kw->schema = get_schema_obj(sos, kind_tmpl);
+	if (!kw->schema)
+		return -1;
+	kw->a_ts = must_attr(kw->schema, "timestamp");
+	kw->a_comp = must_attr(kw->schema, "component_id");
+	kw->a_job = must_attr(kw->schema, "job_id");
+	kw->a_seq = must_attr(kw->schema, "seq");
+	kw->a_idx = must_attr(kw->schema, "component_index");
+
+	kw->n_value_attrs = 0;
+	for (ai = 0; ai < kind->n_attrs; ai++) {
+		const ds_attr_t *da = &kind->attrs[ai];
+		sos_attr_t sa;
+		sa = sos_schema_attr_by_name(kw->schema, da->name);
+		if (!sa)
+			continue;	/* defensive: should always be present */
+		kw->value_attrs[kw->n_value_attrs].sos_attr = sa;
+		kw->value_attrs[kw->n_value_attrs].idx = ai;
+		kw->value_attrs[kw->n_value_attrs].attr = da;
+		kw->n_value_attrs++;
+	}
+	return 0;
+}
+
+/* Write one component instance (a ds_expected_components() record) into
+ * its kind's schema -- the per-kind analog of the flat write loop's body
+ * below. Returns sos_obj_index()'s rc (0 on success). */
+static int write_component(struct kind_writer *kw, uint64_t comp, uint64_t job_id,
+                            uint64_t seq, uint64_t ts, const ds_component_rec_t *rec)
+{
+	size_t vi;
+	sos_obj_t obj = sos_obj_new(kw->schema);
+	if (!obj) {
+		fprintf(stderr, "error %d allocating component object\n", errno);
+		return -1;
+	}
+	set_ts(obj, kw->a_ts, ts);
+	set_u64(obj, kw->a_comp, comp);
+	set_u64(obj, kw->a_job, job_id);
+	set_u64(obj, kw->a_seq, seq);
+	set_u64(obj, kw->a_idx, rec->index);
+	for (vi = 0; vi < kw->n_value_attrs; vi++) {
+		const struct value_attr *va = &kw->value_attrs[vi];
+		set_value(obj, va->attr, va->sos_attr, &rec->values[va->idx]);
+	}
+	int rc = sos_obj_index(obj);
+	sos_obj_put(obj);
+	return rc;
+}
 
 int main(int argc, char **argv)
 {
@@ -337,7 +568,27 @@ int main(int argc, char **argv)
 		fprintf(stderr, "error %d opening container '%s'\n", errno, o.path);
 		return 1;
 	}
-	sos_schema_t schema = get_schema(sos, o.template_path);
+	/* The template file now holds the node schema plus one schema per
+	 * declared component kind (see backends/sos/make_schema.py's
+	 * build_templates()): {"node": {...}, "components": {<kind>: {...}}}.
+	 * Loaded once here into a single parsed tree; get_schema_obj()/
+	 * build_kind_writer() below take slices of it directly rather than
+	 * each re-opening the file. */
+	json_error_t tmpl_jerr;
+	json_t *tmpl_root = json_load_file(o.template_path, 0, &tmpl_jerr);
+	if (!tmpl_root) {
+		fprintf(stderr, "error: %s:%d: %s\n", o.template_path,
+			tmpl_jerr.line, tmpl_jerr.text);
+		return 1;
+	}
+	json_t *node_tmpl = json_object_get(tmpl_root, "node");
+	json_t *components_tmpl = json_object_get(tmpl_root, "components");
+	if (!node_tmpl) {
+		fprintf(stderr, "error: %s: missing 'node'\n", o.template_path);
+		return 1;
+	}
+
+	sos_schema_t schema = get_schema_obj(sos, node_tmpl);
 	if (!schema)
 		return 1;
 	sos_attr_t a_ts = must_attr(schema, "timestamp");
@@ -350,8 +601,9 @@ int main(int argc, char **argv)
 	int idx_seq = ds_attr_index(&ds, "seq");
 
 	/* Resolve every other dataset attribute to its SOS attr handle
-	 * once, up front -- see the struct value_attr comment and this
-	 * file's header comment on the uintN/double scope limit. */
+	 * once, up front -- see the struct value_attr comment. Every
+	 * family (including signed integers) is resolved here and written
+	 * through set_value(). */
 	struct value_attr value_attrs[DS_MAX_ATTRS];
 	size_t n_value_attrs = 0;
 	size_t ai;
@@ -359,18 +611,31 @@ int main(int argc, char **argv)
 		const ds_attr_t *da = &ds.attrs[ai];
 		if (da->is_identity)
 			continue;
-		if (da->family != DS_FAMILY_UINT && da->family != DS_FAMILY_DOUBLE) {
-			fprintf(stderr,
-				"error: attribute '%s' has type '%s', which this SOS "
-				"writer does not support (only uintN and double are, "
-				"today); see this file's header comment\n",
-				da->name, da->type_str);
-			return 1;
-		}
 		value_attrs[n_value_attrs].sos_attr = must_attr(schema, da->name);
 		value_attrs[n_value_attrs].idx = ai;
-		value_attrs[n_value_attrs].family = da->family;
+		value_attrs[n_value_attrs].attr = da;
 		n_value_attrs++;
+	}
+
+	/* Resolve each declared component kind's schema and value attrs
+	 * once, up front, same as the flat attrs above -- see struct
+	 * kind_writer and build_kind_writer(). */
+	struct kind_writer kind_writers[DS_MAX_KINDS];
+	size_t ki;
+	for (ki = 0; ki < ds.n_kinds; ki++) {
+		const ds_kind_t *kind = &ds.kinds[ki];
+		json_t *kind_tmpl = components_tmpl
+			? json_object_get(components_tmpl, kind->kind) : NULL;
+		if (!kind_tmpl) {
+			fprintf(stderr,
+				"error: %s: 'components' has no template for kind '%s' "
+				"(DATASET and the template file must come from the "
+				"same dataset JSON, via make_schema.py)\n",
+				o.template_path, kind->kind);
+			return 1;
+		}
+		if (build_kind_writer(sos, kind_tmpl, kind, &kind_writers[ki]))
+			return 1;
 	}
 
 	uint64_t base = (uint64_t)(o.node_index + 1) * 1000;
@@ -403,10 +668,7 @@ int main(int argc, char **argv)
 			set_u64(obj, a_seq, values[idx_seq].u64);
 			for (vi = 0; vi < n_value_attrs; vi++) {
 				const struct value_attr *va = &value_attrs[vi];
-				if (va->family == DS_FAMILY_UINT)
-					set_u64(obj, va->sos_attr, values[va->idx].u64);
-				else
-					set_double(obj, va->sos_attr, values[va->idx].d);
+				set_value(obj, va->attr, va->sos_attr, &values[va->idx]);
 			}
 			rc = sos_obj_index(obj);
 			sos_obj_put(obj);
@@ -417,6 +679,42 @@ int main(int argc, char **argv)
 						rc, written);
 			}
 			written++;
+
+			if (ds.n_kinds) {
+				static ds_component_rec_t comp_recs[MAX_COMPONENT_RECS];
+				int n_recs = ds_expected_components(
+					&ds, comp, values[idx_job].u64, seq,
+					comp_recs, MAX_COMPONENT_RECS);
+				int ri;
+				if (n_recs < 0) {
+					fprintf(stderr,
+						"error: record %" PRIu64 ": more than %d component "
+						"instances; raise MAX_COMPONENT_RECS\n",
+						written, MAX_COMPONENT_RECS);
+					return 1;
+				}
+				for (ri = 0; ri < n_recs; ri++) {
+					const ds_component_rec_t *rec = &comp_recs[ri];
+					/* rec->kind points into ds.kinds[] (see
+					 * ds_expected_components() in core/dataset.c),
+					 * so its offset from ds.kinds is that kind's
+					 * index into kind_writers[], built in the same
+					 * order above. */
+					size_t kwi = (size_t)(rec->kind - ds.kinds);
+					rc = write_component(&kind_writers[kwi], comp,
+						values[idx_job].u64, seq,
+						values[idx_ts].u64, rec);
+					if (rc) {
+						errors++;
+						if (errors <= 10)
+							fprintf(stderr,
+								"error %d indexing %s[%" PRIu64 "] "
+								"for record %" PRIu64 "\n",
+								rc, rec->kind->kind, rec->index, written);
+					}
+				}
+			}
+
 			if (++in_batch == o.batch) {
 				sos_container_commit(sos, SOS_COMMIT_ASYNC);
 				sos_end_x(sos);
@@ -452,5 +750,6 @@ int main(int argc, char **argv)
 	       t_write - t_start, t_indexed - t_write, t_end - t_indexed,
 	       t_end - t_start, written / (t_end - t_write));
 	ds_free(&ds);
+	json_decref(tmpl_root);
 	return errors ? 1 : 0;
 }

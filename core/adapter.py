@@ -69,5 +69,34 @@ class Adapter:
         attribute name. Used for verification only; not timed."""
         raise NotImplementedError
 
+    def postprocess(self, text, columns, rows):
+        """Backend-specific shaping of a query's full, assembled result,
+        after every batch has been merged and column names reversed back
+        to dataset attribute names (core/bench.py's collect()) -- used
+        for verification only, like records(), and likewise not timed.
+
+        Default: no-op (most backends need none). Exists for a backend
+        whose native query language cannot express something another
+        backend's query *text* can (e.g. a JOIN or DISTINCT): rather than
+        inventing non-native syntax, such a backend's query text can
+        target a simpler, real native query, and this hook does the rest
+        of the assembly in the adapter's own code -- the same thing a
+        normal client without that language feature would have to do
+        itself. See backends/sos/query/sos_query.py's and
+        backends/dsos/query/dsos_query.py's postprocess() for a concrete
+        case: collapsing multiple matching component-kind instances of
+        one node sample into the one node-shaped row design/
+        value-generation.md Sec 6.5's kind[*].attr existential condition
+        expects, which the SOS/DSOS query language has no DISTINCT/JOIN
+        to do natively.
+
+        Only called from the untimed verification path (collect()), not
+        from the timed one (timed_run()), so it never affects a timing
+        measurement; a backend that needs the same shaping to get a
+        *correct* row count for a timed run already has to do it inside
+        query()/count() themselves, as query()'s own docstring says.
+        """
+        return rows
+
     def close(self):
         pass
