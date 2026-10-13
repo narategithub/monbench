@@ -3,8 +3,8 @@
 # The first two nodes of the allocation become servers, the third the query
 # node (unless SERVER_NODES / QUERY_NODE are exported before sbatch).
 #
-#   sbatch slurm/monbench.sbatch                 # build serve-write write serve check stop
-#   sbatch slurm/monbench.sbatch build serve-write write serve check live stop
+#   sbatch slurm/monbench.sbatch                 # build serve-write write serve-query check query stop
+#   sbatch slurm/monbench.sbatch build serve-write write serve-query check live stop
 #
 #SBATCH --job-name=monbench
 #SBATCH --nodes=3
@@ -18,3 +18,4 @@ cd "${SLURM_SUBMIT_DIR}"
 PHASES=("$@")
 [[ ${#PHASES[@]} -gt 0 ]] || PHASES=(all)
 bin/run.sh -l slurm "${PHASES[@]}"
+

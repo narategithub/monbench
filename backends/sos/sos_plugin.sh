@@ -2,7 +2,9 @@
 # or dsos. The dsos plugin sources this file for its write side.
 #
 # This backend writes one local SOS container per server, using the SOS API.
-# It provides no query adapter; see backends/dsos for querying.
+# It also provides a direct, on-disk query adapter (query/sos_query.py,
+# QUERY_ADAPTER=sos) for a single-node/shared-filesystem comparison point
+# with no RPC; see backends/dsos for querying across servers through dsosd.
 #
 # Hooks (see backends/README.md for the contract):
 #   plugin_build                              build the C writer

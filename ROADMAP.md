@@ -13,7 +13,7 @@ output formats) are in `README.md`, "Assumptions and limits".
 - **Out of scope** — deliberately not covered by the suite.
 - **Done** — completed; kept for the record of why.
 
-Last updated: 2026-10-07
+Last updated: 2026-10-12
 
 ---
 
@@ -121,13 +121,21 @@ Last updated: 2026-10-07
     * Generate backend strings from the neutral `match` description.
   * Status: **Deferred.** Manual strings are enough for the current backends.
 
-* **Verifier understands only simple conditions**
+* **Verifier's condition grammar still has gaps**
   * Current limitation:
-    * `match.where` supports `attribute op number` joined by `and`.
-    * No `or`, no aggregates, no grouping; such queries run unverified (INFO).
+    * `match.where` supports `attribute op number` and, as of the
+      value-generation refactor (`design/value-generation.md` Sec 6.5),
+      two more condition forms generic over any declared component kind:
+      `kind[i].attr op value` / `kind[*].attr op value` (indexed and
+      existential) and `count(kind) op n` (cardinality) — see
+      `core/bench.py`'s `parse_match()`/`record_matches()` and
+      `queries/curated_metrics.json` for worked examples.
+    * Still missing: `or`, aggregates, and grouping. Such queries run
+      unverified (INFO) or with `"verify": false`.
   * Options:
-    * Extend the condition grammar; add expected results for aggregates.
-  * Status: **Deferred.**
+    * Extend the condition grammar further; add expected results for aggregates.
+  * Status: **Deferred** (for `or`/aggregates/grouping). The component-kind
+    forms above are **Done**.
 
 * **No aggregation, downsampling or derivative queries**
   * Current limitation:
@@ -143,76 +151,64 @@ Last updated: 2026-10-07
 
 ## Data sets
 
-* **One data shape**
+* **One data shape authored so far**
   * Current limitation:
-    * Only the default monitoring shape exists.
-    * `dataset/default.json` lists attributes and keys, but the value rules are code in `core/dataset.py` and the writers.
+    * Only the default monitoring shape (`dataset/default.json`) and the
+      component-kind worked example (`dataset/curated_metrics_like.json`)
+      exist.
+    * Previously this item also covered the value rules being hardcoded
+      Python/C code; that part is **done** — the value-generation
+      refactor (`design/value-generation.md`) made every value rule
+      (including component-kind generation) a pure function of a
+      dataset's own JSON declaration, computed by the shared
+      `core/valuegen.py`/`.c`. Defining a new dataset, flat or nested,
+      needs no change to `core/dataset.py`, `core/valuegen.py`, or any
+      backend's writer code (see `EXTENDING.md`, "Defining a custom
+      dataset").
   * Options:
-    * Additional shapes (wide, narrow, other entity models), each with its own value rules.
-  * Status: **Deferred.**
+    * Additional shapes (wide, narrow, other entity models) are now just
+      more `dataset/<n>.json` files; no code-level option remains open
+      here.
+  * Status: **Done** (value-rule hardcoding). Writing more example
+    datasets is not tracked as a limitation any more, just something to
+    do as the need arises.
 
 * **Per-CPU and per-interface records**
   * Background:
     * The default data set's attribute names and units are modeled on the
       `curated_metrics` LDMS sampler plugin, which exposes `/proc/meminfo`,
       `/proc/loadavg` and the scalar `/proc/stat` counters as flat metrics —
-      these are all in the default data set now (see `README.md`, "The data
+      these are all in the default data set (see `README.md`, "The data
       set"). `curated_metrics` also exposes per-CPU-core `/proc/stat` fields
-      and per-network-interface `/proc/net/dev` fields, but as nested LDMS
+      and per-network-interface `/proc/net/dev` fields, as nested LDMS
       *records*: a variable-length list of per-core or per-interface values
       attached to each sample, not flat scalars.
-  * Current limitation:
-    * `core/bench.py`'s verifier (`parse_match`/`COND_RE`) only understands
-      `match.where` conditions of the form `attribute op number` against one
-      flat `ATTRS` tuple, and `Dataset.records()`/`expected()` produce one
-      flat row per `(component_id, seq)`. There is no concept of a nested
-      sub-row (one row per core or per interface within a sample), so
-      per-core/per-interface metrics cannot be added as-is: doing so needs
-      either a verifier that understands nested records and conditions that
-      reach into them, or flattening the records into the row some other
-      way.
-    * This was scoped out of the curated_metrics-alignment work (see git
-      history around 2026-10-07): that work added the 19 flat metrics only
-      and deliberately left the per-core/per-interface metrics out, rather
-      than attempting a verifier redesign under that task.
-  * Options:
-    * **Wide columns (recommended starting point).** Flatten a fixed number
-      of cores/interfaces per component into named scalar attributes —
-      `cpu0_user`, `cpu0_idle`, ..., `cpu3_idle`, `eth0_rx_bytes`,
-      `eth0_tx_bytes`, `eth1_rx_bytes`, `eth1_tx_bytes` — each a deterministic
-      function of `(component_id, seq)` like every other attribute. This
-      needs no verifier change at all: it is just more entries in `ATTRS` and
-      `Dataset.expected()`, exactly like this task's 19 new metrics. The
-      fixed count must be the same for every component. **4 CPU cores and 2
-      network interfaces per component** is a reasonable default scale for
-      synthetic data (matches common small HPC node configurations) and is
-      recommended if/when this is implemented, unless a specific site's node
-      shape calls for a different number.
-    * **True nested records.** Model cores/interfaces as an actual nested
-      sub-row per sample, closer to what `curated_metrics` really exposes on
-      the wire. This needs: a second-level `ATTRS`-like tuple per record
-      type, a `Dataset.expected()` that returns nested structures, a verifier
-      that can express and check conditions over the nested rows (e.g. "any
-      core's `idle` < X", "interface `eth0`'s `rx_bytes` over a window"), and
-      backend-specific schema/writer support for a one-to-many shape (SOS
-      sub-objects or a join schema; a separate InfluxDB measurement keyed by
-      component_id+core/interface index). This is a genuine framework
-      redesign, not an incremental attribute addition — substantially more
-      work than the wide-columns option, and was the reason this was deferred
-      rather than attempted as part of adding the flat metrics.
-  * Status: **Deferred.** Recommended path when picked up: wide columns, 4
-    cores + 2 interfaces per component, as a straightforward extension of
-    `ATTRS`/`Dataset.expected()`; revisit true nested records only if a
-    benchmark question specifically needs per-core/per-interface filtering
-    or aggregation that wide columns cannot express.
-
-    **Note (2026-10-09): superseded in part.** `design/value-generation.md`
-    Sec 6 and `core/dataset.py`/`core/valuegen.py` now implement true nested
-    component-kind records generically (any kind/attributes a dataset
-    declares, not a fixed cpu/netdev pair) — see `dataset/curated_metrics_like.json`
-    and `STATUS.md`. The "wide columns" option above was not taken. Backend
-    schema mapping and native queries for this are implemented for InfluxDB
-    only so far (`STATUS.md`); SOS/DSOS mapping remains open.
+  * Resolution:
+    * Rather than the "wide columns" option previously recommended here,
+      this was implemented as **true nested records** — generic
+      **component kinds** (`design/value-generation.md` Sec 6): a dataset
+      declares zero or more component kinds, each a flat record with a
+      variable, per-sample instance count, one level of nesting below the
+      node. `dataset/curated_metrics_like.json`'s `cpu` and `netdev` kinds
+      are the worked example, modeled directly on `curated_metrics`'s own
+      per-core/per-interface records.
+    * Generation (`core/valuegen.py`/`.c`) and verification
+      (`core/bench.py`'s `kind[i].attr`/`kind[*].attr`/`count(kind)`
+      condition grammar) are implemented and backend-neutral. Backend
+      schema mapping and native `kind[i]`/`kind[*]` queries are
+      implemented for `influxdb`, `sos` and `dsos` (see each backend's
+      README.md, "Component-kind data model mapping", and
+      `queries/curated_metrics.json`); `count(kind)` is native only on
+      `influxdb` (see `STATUS.md`).
+    * Not yet done: smoke-testing any of this against real SOS/DSOS/
+      InfluxDB servers (`STATUS.md`'s "Suggested next step"), and the
+      "true nested records within a component" extension (`component →
+      sub-component[]`) that `design/value-generation.md` Sec 6.6
+      explicitly leaves out of scope.
+  * Status: **Done** (generation, verification, and backend mapping for
+    one level of component nesting). The two-level-nesting
+    (sub-component) extension remains **Out of scope** (design doc
+    Sec 6.6); real-server smoke-testing is tracked in `STATUS.md`.
 
 * **No support for existing data from other sources**
   * Current limitation:

@@ -12,7 +12,7 @@ own partition, and the client merges the results in index order.
 | Query | Yes, across all servers through `dsosd` |
 | Reads data written by | `sos`, `dsos` (declared in `PLUGIN_READS`) |
 | Service | `dsosd` on each server node; started in `serve-write` and stopped in `stop` |
-| Component kinds (design/value-generation.md Sec 6) | Yes, same mapping as the `sos` backend -- see `backends/sos/README.md`'s "Component-kind data model mapping" |
+| Component kinds (design/value-generation.md Sec 6) | Yes -- see "Component-kind data model mapping" below |
 
 The DSOS writer stores data in the same SOS container format as the `sos`
 backend, so data written by either backend can be queried by either.
@@ -34,11 +34,41 @@ Two adapters, selected with `QUERY_ADAPTER` (empty selects the default):
 | `dsosql` | the `dsosql` command, CSV output parsed | starts a `dsosql` process per query | cross-checking results; its timings include process start-up and connecting, so not for performance comparison |
 
 Both speak the same query language (dialect `dsos`), so they share the query
-strings in a query set -- including the component-kind `kind[i].attr`/
-`kind[*].attr` query strings, since `dsos_write.py` writes the same
-per-kind schemas the `sos` writers do (see `backends/sos/README.md`'s
-"Component-kind data model mapping"; `count(kind)` is not natively
-queryable here either, for the same reason).
+strings in a query set.
+
+## Component-kind data model mapping
+
+A dataset may also declare component kinds (design/value-generation.md
+Sec 6) -- see `dataset/curated_metrics_like.json`'s `cpu`/`netdev` for a
+worked example. DSOS writes and queries them exactly the way the `sos`
+backend does, because both store into the same SOS container format and
+schema shape (see `backends/sos/README.md`'s "Component-kind data model
+mapping" for the full mapping table): one SOS schema per declared kind,
+named `{schema}_<kind>`, built by the same `backends/sos/make_schema.py`.
+
+- **Writing:** `dsos_write.py` gained a `KindWriter` mirroring
+  `sos_write.py`'s -- it writes every component instance
+  (`Dataset.expected_components()`) into its kind's schema through the
+  same `dsosd` session the flat node records go through.
+- **Querying:** `dsos_query.py`'s `dsos` and `dsosql` adapters answer
+  `kind[i].attr`/`kind[*].attr` (design doc Sec 6.5) by selecting
+  directly from the per-kind schema -- the DSOS query language has no
+  JOIN, so there is nothing to join against the node schema in the query
+  text itself. The existential form (`kind[*].attr`) can return more
+  than one row per node sample when more than one instance matches; both
+  adapters' `postprocess()` collapses those into one row, generically
+  (by comparing the query's own `FROM` target against the dataset's
+  schema name, so it needs no list of declared kind names), the same
+  effect InfluxDB's native `SELECT DISTINCT ... JOIN ...` gets. See
+  `queries/curated_metrics.json`'s `"dsos"` entries for worked examples.
+- **`count(kind)` has no native query here** -- the DSOS query language
+  has no `GROUP BY`/`HAVING`-style count filter -- so that condition
+  reports SKIP under this backend (see `STATUS.md`).
+- **Type mapping:** every attribute type maps onto a real SOS schema type
+  (`backends/sos/make_schema.py`'s `sos_attr()`): `string` becomes a
+  fixed-length CHAR_ARRAY, `uint8`/`int8` widen to `UINT16`/`INT16`.
+  Nothing is dropped. `dataset/curated_metrics_like.json`'s `cpu_name`/
+  `iface_name` (both `string`) are written as CHAR_ARRAY.
 
 ## Configuration
 
@@ -49,7 +79,7 @@ Settings live in `backends/dsos/dsos_backend.conf` (override from the environmen
 | `DSOSD` | `dsosd` | The `dsosd` command. Set to `sudo -E dsosd` if registering with `rpcbind` needs root |
 | `DSOSQL` | `dsosql` | The `dsosql` command (used by the `dsosql` adapter) |
 | `SOS_ROW_LIMIT` | `4096` | Rows per batch the `dsos` adapter fetches |
-| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}/` | Where each server's containers are; must match the `sos` backend's value so `dsosd` finds them |
+| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}` | Where each server's containers are; must match the `sos` backend's value so `dsosd` finds them |
 
 ### Choosing the query adapter
 

@@ -7,7 +7,8 @@
 # Which backend writes the data, and which queries it. Each is the name of a
 # directory under backends/. They are usually the same, but the primary
 # real-world case here is writing with sos and querying with dsos.
-#   sos      write local SOS containers (C or Python); no query adapter yet
+#   sos      write local SOS containers (C or Python); can also query them
+#            directly on disk (no dsosd needed)
 #   dsos     query SOS containers across servers through dsosd
 #   influxdb write and query InfluxDB v3
 WRITE_BACKEND="${WRITE_BACKEND:-sos}"

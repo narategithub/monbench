@@ -60,7 +60,7 @@ dataset declares:
 |---|---|
 | kind name | schema `{schema}_<kind>` (e.g. `monitoring_nested_cpu`), built by `make_schema.py`'s `convert_kind()` |
 | `component_id`, `job_id`, `seq`, `component_index` | plain attributes (`component_id` and `timestamp` indexed) |
-| the kind's own attributes | plain attributes, same type mapping as the node schema (see "Scope limit" below) |
+| the kind's own attributes | plain attributes, same type mapping as the node schema (see "Scope" below) |
 | `timestamp` of the node sample this instance belongs to | the `timestamp` attribute, indexed; also joined with `component_id` into a `comp_time` JOIN attribute, the same shape and name the node schema's own `comp_time` key already uses |
 
 This is the same shape the node schema already uses -- one schema per
@@ -85,16 +85,19 @@ JOIN ...` gets from its own query language. See
 no `GROUP BY`/`HAVING`-style count filter -- so that condition still
 reports SKIP under this backend (see `STATUS.md`).
 
-**Scope limit:** every attribute type maps onto a real SOS schema type
+**Scope:** every attribute type maps onto a real SOS schema type
 (`make_schema.py`'s `sos_attr()`): `string` becomes a fixed-length
 CHAR_ARRAY, and `uint8`/`int8` widen to the closest wider SOS integer
-type (`UINT16`/`INT16`) since SOS has no 8-bit integer type. Nothing is
-dropped. The one remaining gap is signed integers wider than 8 bits
-(`int16`/`int32`/`int64`): `sos_write.c`'s writer does not yet write
-them (see that file's header comment); this is a writer limitation, not
-a schema one -- the schema attribute exists, it's just not populated by
-the C writer today. In `dataset/curated_metrics_like.json`, `cpu_name`
-and `iface_name` (both `string`) are written to SOS as CHAR_ARRAY.
+type (`UINT16`/`INT16`) since SOS has no 8-bit integer type. `sos_write.c`
+writes every family, signed integers of every width included
+(`int8`/`int16`/`int32`/`int64`, via `set_value()`'s `DS_FAMILY_INT`
+case), flat and per component kind alike -- nothing is dropped or
+unsupported at the writer level any more. The remaining caveat is that
+this has not been built or smoke-tested against a real SOS install in
+any environment that produced this code (no `libsos`/`libods` available
+there); see `STATUS.md` item 8. In `dataset/curated_metrics_like.json`,
+`cpu_name` and `iface_name` (both `string`) are written to SOS as
+CHAR_ARRAY.
 
 **Requirement:** the containers must be accessible from the query node.
 This works when the query node is also a server node, or on a shared
@@ -109,7 +112,7 @@ Settings live in `backends/sos/sos_backend.conf` (override from the environment)
 | Setting | Default | Purpose |
 |---|---|---|
 | `SOS_PREFIX` | `/opt/ovis` | SOS installation prefix; used to build the C writer |
-| `SOS_DATA_ROOT` | `${RUN_DIR}/sos-dsos/data/${HOSTNAME}/` | Container root; each server uses `SOS_DATA_ROOT/<server-id>/` |
+| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}` | Container root; each server uses `SOS_DATA_ROOT/<server-id>/` |
 | `SOS_STORAGE` | `mmos` | SOS storage type for new containers: `mmos` or `lsos` |
 | `SOS_ROW_LIMIT` | `4096` | Rows per batch fetched by the query adapter |
 
