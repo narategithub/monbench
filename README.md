@@ -21,7 +21,7 @@ is the starting point for others.
 
 | Path | Purpose |
 |---|---|
-| `bench.conf.example` | Template for `bench.conf`: backend, nodes, paths, data-set size, query settings |
+| `bench.conf.example` | Template for `bench.conf`: backend, hosts, paths, data-set size, query settings |
 | `bin/run.sh` | Driver: runs each phase on the right nodes via ssh, Slurm or by hand |
 | `bin/node.sh` | Actions executed on a single node; calls the backend's hooks |
 | `core/dataset.py` | The data set: value rules, parameters, metadata files |
@@ -73,8 +73,8 @@ Each backend has additional requirements described in its own README under
 ## The data set
 
 The data set is split into one partition per server. Each server writes
-`COMPONENTS_PER_NODE × SAMPLES` records (80,000 by default). Every record is
-a function of its `component_id` and `seq` (the sample number, 0 through
+`COMPONENT_IDS_PER_SERVER × SAMPLES` records (80,000 by default). Every record
+is a function of its `component_id` and `seq` (the sample number, 0 through
 `SAMPLES − 1`), so any row can be verified on its own. `seq` is stored as
 an attribute alongside the computed values; it has no physical meaning
 outside the benchmark but is what makes every row uniquely identifiable for
@@ -88,7 +88,7 @@ verifies every answer against:
 
 | Attribute | Value |
 |---|---|
-| `component_id` | `(partition + 1) × 1000 + c`, for c in `[0, COMPONENTS_PER_NODE)` |
+| `component_id` | `(partition + 1) × 1000 + c`, for c in `[0, COMPONENT_IDS_PER_SERVER)` |
 | `timestamp` | `T0 + seq × INTERVAL` |
 | `job_id` | `1 + seq ÷ JOB_LEN` (integer division; each job spans all servers) |
 | `MemTotal`, `free`, `buff`, `cached`, `active`, `inactive`, `dirty`, `writeback` | `/proc/meminfo`-style total (kB) and percentages, each a different deterministic function of `component_id` and `seq` |
@@ -170,10 +170,10 @@ bin/run.sh -l ssh stop                # stop both services when done
 
 Select with `-l`: `bin/run.sh -l slurm all`.
 
-When the Slurm launcher is used and `SERVER_NODES` is not set in `bench.conf`
+When the Slurm launcher is used and `SERVER_HOSTS` is not set in `bench.conf`
 or the environment, the harness fills it from the allocation: all nodes
-except the last become servers; the last becomes the query node. Override
-`SERVER_NODES` and `QUERY_NODE` to control the split.
+except the last become servers; the last becomes the query host. Override
+`SERVER_HOSTS` and `QUERY_HOST` to control the split.
 
 In manual mode, change settings in the configuration files rather than in
 the shell environment, because the commands you type on the other nodes read
@@ -219,7 +219,7 @@ records, the row count never decreases, and the final count is reached.
 ## Quick start
 
 1. Copy `bench.conf.example` to `bench.conf` and edit it: at minimum
-   `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_NODES`, `QUERY_NODE` and,
+   `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_HOSTS`, `QUERY_HOST` and,
    if the backend's software is not on the default paths, `ENV_SETUP`.
 2. Edit `backends/<BACKEND>/<BACKEND>_backend.conf` for each backend you
    are using (see `backends/<n>/README.md` for what each setting does).
@@ -254,8 +254,8 @@ bin/run.sh -c bench-sos-dsos.conf -l ssh all
 bin/run.sh -c bench-influxdb3.conf -l ssh all
 ```
 
-Each config sets its own `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_NODES`,
-`QUERY_NODE` and any backend-specific settings. Results go to each config's
+Each config sets its own `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_HOSTS`,
+`QUERY_HOST` and any backend-specific settings. Results go to each config's
 own `RESULTS_DIR`.
 
 ## Query sets

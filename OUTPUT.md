@@ -27,7 +27,7 @@ structure:
 {
   "target":    "<target name>",
   "dataset":   { ... },           # data set parameters (see below)
-  "servers":   ["host1", ...],    # server nodes used
+  "servers":   ["host1", ...],    # server hosts used
   "ingest":    { ... },           # write-side results (see below)
   "query":     { ... },           # query-side results (see below)
   "all_passed": true|false        # false if any check failed
@@ -40,9 +40,9 @@ The data set parameters used for this run.
 
 | Field | Description |
 |---|---|
-| `partitions` | number of server partitions (one per server node) |
-| `components_per_partition` | components (time series) per partition |
-| `samples` | data points per component |
+| `partitions` | number of server partitions (one per server host) |
+| `component_ids_per_partition` | component IDs (time series) per partition |
+| `samples` | data points per component ID |
 | `t0` | timestamp of the first sample (Unix seconds) |
 | `interval` | seconds between consecutive samples |
 | `job_len` | samples per job |
@@ -54,7 +54,7 @@ Aggregated write-side results, read from the per-host writer JSON files.
 ```
 "ingest": {
   "backend": "sos",
-  "nodes": [
+  "hosts": [
     {
       "host":          "server-01",
       "backend":       "sos",
@@ -75,10 +75,10 @@ Aggregated write-side results, read from the per-host writer JSON files.
 }
 ```
 
-Per-node fields come directly from the writer's JSON output. The summary
-aggregates across all nodes: `total_records` is the sum; `max_write_s` and
+Per-host fields come directly from the writer's JSON output. The summary
+aggregates across all hosts: `total_records` is the sum; `max_write_s` and
 `max_sync_s` are the worst case; `aggregate_records_per_s` divides the
-total records by the slowest node's elapsed time (write + sync).
+total records by the slowest host's elapsed time (write + sync).
 
 ### `query`
 
@@ -152,7 +152,7 @@ live-poll behaviour:
 |---|---|
 | `rows never decrease` | the row count returned by each poll is >= the previous poll's count |
 | `every answer valid` | every polled answer contains only valid, non-duplicated records (each row checked against the data set) |
-| `final count reached` | the last poll returned the full data set size (all partitions × components × samples) |
+| `final count reached` | the last poll returned the full data set size (all partitions × component IDs × samples) |
 | `query errors while writing` | always INFO; reports how many polls returned an error (e.g. the target did not exist yet when the first poll ran) |
 
 The `detail` field on each entry carries the specifics: poll counts for
@@ -165,7 +165,7 @@ valid`, and the final vs expected count for `final count reached`.
 ### Write side — self-timed on the server
 
 Each writer is a standalone program (C binary or Python script) that runs
-on a server node via ssh or srun. The core harness cannot directly time a
+on a server host via ssh or srun. The core harness cannot directly time a
 remote process, so each writer measures and reports its own timing.
 
 The writer's JSON output includes:
@@ -208,7 +208,7 @@ region — connection setup is measured once, not per query.
 
 Write timing is server-local because the writer runs on the server. Query
 timing is client-perceived because the benchmark engine runs on the query
-node and measures what a real client would experience. These are different
+host and measures what a real client would experience. These are different
 vantage points by design:
 
 - **Writer self-timing** allows each backend to report its own internal

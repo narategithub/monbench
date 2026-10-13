@@ -44,14 +44,14 @@ shift $((OPTIND - 1))
 [[ $# -gt 0 ]] || { sed -n '2,26p' "$0"; exit 2; }
 case "$LAUNCHER" in ssh | slurm | manual) ;; *) echo "unknown launcher '$LAUNCHER'" >&2; exit 2 ;; esac
 
-# In the Slurm launcher, empty node settings are filled from the allocation.
+# In the Slurm launcher, empty host settings are filled from the allocation.
 if [[ "$LAUNCHER" == "slurm" ]]; then
 	[[ -n "${SLURM_JOB_ID:-}" ]] || { echo "the slurm launcher must run inside an allocation (salloc/sbatch)" >&2; exit 1; }
 	mapfile -t ALLOC < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
-	if [[ -z "${SERVER_NODES:-}" ]]; then
+	if [[ -z "${SERVER_HOSTS:-}" ]]; then
 		[[ ${#ALLOC[@]} -ge 3 ]] || { echo "need 3 nodes in the allocation, have ${#ALLOC[@]}" >&2; exit 1; }
-		export SERVER_NODES="${ALLOC[0]} ${ALLOC[1]}"
-		export QUERY_NODE="${QUERY_NODE:-${ALLOC[2]}}"
+		export SERVER_HOSTS="${ALLOC[0]} ${ALLOC[1]}"
+		export QUERY_HOST="${QUERY_HOST:-${ALLOC[2]}}"
 	fi
 fi
 
@@ -98,14 +98,14 @@ if [[ -n "${Q_READS}" && " ${Q_READS} " != *" ${WRITE_BACKEND} "* ]]; then
 	exit 1
 fi
 
-read -r -a SERVERS <<<"${SERVER_NODES}"
-[[ ${#SERVERS[@]} -ge 1 ]] || { echo "SERVER_NODES must list at least one host" >&2; exit 1; }
+read -r -a SERVERS <<<"${SERVER_HOSTS}"
+[[ ${#SERVERS[@]} -ge 1 ]] || { echo "SERVER_HOSTS must list at least one host" >&2; exit 1; }
 [[ -n "${WRITERS}" ]] || { echo "no WRITERS set and backend ${WRITE_BACKEND} has no DEFAULT_WRITERS" >&2; exit 1; }
 
 # Settings forwarded to every remote step so that environment overrides given
 # to run.sh apply on all nodes, not only here.
-CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_NODES QUERY_NODE BENCH_DIR RUN_DIR RESULTS_DIR
-	ENV_SETUP PYTHON DATASET WRITERS DATA_NAME COMPONENTS_PER_NODE SAMPLES T0
+CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_HOSTS QUERY_HOST BENCH_DIR RUN_DIR RESULTS_DIR
+	ENV_SETUP PYTHON DATASET WRITERS DATA_NAME COMPONENT_IDS_PER_SERVER SAMPLES T0
 	INTERVAL JOB_LEN BATCH QUERY_ADAPTER QUERY_FILE REPEAT LIMIT_N
 	LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL)
 # Forward each plugin's own settings too, from both backends.
@@ -192,7 +192,7 @@ phase_deploy() {
 	marker="${BENCH_DIR}/.monbench-id"
 	[[ -f "$marker" ]] || od -An -N8 -tx8 /dev/urandom | tr -d ' ' >"$marker"
 	id="$(cat "$marker")"
-	for host in "${SERVERS[@]}" "${QUERY_NODE}"; do
+	for host in "${SERVERS[@]}" "${QUERY_HOST}"; do
 		if [[ "$(ssh -n ${SSH_OPTS} "$host" cat "$(printf '%q' "$marker")" 2>/dev/null || true)" == "$id" ]]; then
 			echo "   ${host}: directory is shared, nothing to copy"
 			continue
@@ -222,7 +222,7 @@ phase_write() {
 		say "write: ${target} with the ${WRITE_BACKEND} ${w} writer on ${SERVERS[*]}"
 		if BE="${WRITE_BACKEND}" on_servers "write-${target}" write "$w" "$target" full; then
 			# Record what was written, where the query node will read it.
-			BE="${WRITE_BACKEND}" remote "${QUERY_NODE}" "meta-${target}" meta "$target" "$w" full || FAILED=1
+			BE="${WRITE_BACKEND}" remote "${QUERY_HOST}" "meta-${target}" meta "$target" "$w" full || FAILED=1
 		else
 			FAILED=1
 		fi
@@ -298,8 +298,8 @@ phase_check() {
 	local w target
 	for w in ${WRITERS}; do
 		target="${DATA_NAME}_${w}"
-		say "check: ${target} from ${QUERY_NODE}"
-		BE="${QUERY_BACKEND}" remote "${QUERY_NODE}" "check-${target}" check "$target" || FAILED=1
+		say "check: ${target} from ${QUERY_HOST}"
+		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-${target}" check "$target" || FAILED=1
 	done
 }
 
@@ -307,22 +307,22 @@ phase_query() {
 	local w target
 	for w in ${WRITERS}; do
 		target="${DATA_NAME}_${w}"
-		say "query: ${target} from ${QUERY_NODE}"
-		BE="${QUERY_BACKEND}" remote "${QUERY_NODE}" "query-${target}" query "$target" || FAILED=1
+		say "query: ${target} from ${QUERY_HOST}"
+		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "query-${target}" query "$target" || FAILED=1
 	done
 }
 
 phase_live() {
-	say "live: ${LIVE_WRITER} writer at ${LIVE_RATE} records/s per server while ${QUERY_NODE} polls"
+	say "live: ${LIVE_WRITER} writer at ${LIVE_RATE} records/s per server while ${QUERY_HOST} polls"
 	if [[ "$LAUNCHER" == "manual" ]]; then
 		on_servers "write-${LIVE_TARGET}" write "${LIVE_WRITER}" "${LIVE_TARGET}" live
-		BE="${QUERY_BACKEND}" remote "${QUERY_NODE}" "check-live" check "${LIVE_TARGET}" live
+		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-live" check "${LIVE_TARGET}" live
 		return 0
 	fi
 	BE="${WRITE_BACKEND}" on_servers "write-${LIVE_TARGET}" write "${LIVE_WRITER}" "${LIVE_TARGET}" live &
 	local writers_pid=$!
 	sleep 3
-	BE="${QUERY_BACKEND}" remote "${QUERY_NODE}" "check-live" check "${LIVE_TARGET}" live || FAILED=1
+	BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-live" check "${LIVE_TARGET}" live || FAILED=1
 	wait "$writers_pid" || FAILED=1
 }
 
@@ -349,8 +349,8 @@ phase_clean() {
 	done
 }
 
-echo "monbench: write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHER} servers=${SERVERS[*]} query-node=${QUERY_NODE}"
-echo "          ${COMPONENTS_PER_NODE} components x ${SAMPLES} samples per server, writers: ${WRITERS}"
+echo "monbench: write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHER} servers=${SERVERS[*]} query-host=${QUERY_HOST}"
+echo "          ${COMPONENT_IDS_PER_SERVER} component IDs x ${SAMPLES} samples per server, writers: ${WRITERS}"
 PHASES=()
 for phase in "$@"; do
 	case "$phase" in

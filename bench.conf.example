@@ -15,12 +15,12 @@ WRITE_BACKEND="${WRITE_BACKEND:-sos}"
 QUERY_BACKEND="${QUERY_BACKEND:-dsos}"
 
 # ---------------------------------------------------------------- nodes
-# Server nodes (each holds one partition of the data set) and one query node.
+# Server hosts (each holds one partition of the data set) and one query host.
 # The names must resolve from every node. With the Slurm launcher, unless
-# SERVER_NODES is set in the environment, the nodes come from the allocation:
-# the first two become servers and the third becomes the query node.
-SERVER_NODES="${SERVER_NODES:-node01 node02}"
-QUERY_NODE="${QUERY_NODE:-login01}"
+# SERVER_HOSTS is set in the environment, the hosts come from the allocation:
+# the first two become servers and the third becomes the query host.
+SERVER_HOSTS="${SERVER_HOSTS:-node01 node02}"
+QUERY_HOST="${QUERY_HOST:-login01}"
 
 # ---------------------------------------------------------------- paths
 # BENCH_DIR must exist at the same path on all nodes. On a shared filesystem
@@ -46,8 +46,8 @@ DATASET="${DATASET:-${BENCH_DIR}/dataset/default.json}"
 WRITERS="${WRITERS:-}"
 DATA_NAME="${DATA_NAME:-monitoring}"
 
-# Records per server = COMPONENTS_PER_NODE * SAMPLES (80,000 by default).
-COMPONENTS_PER_NODE="${COMPONENTS_PER_NODE:-16}"
+# Records per server = COMPONENT_IDS_PER_SERVER * SAMPLES (80,000 by default).
+COMPONENT_IDS_PER_SERVER="${COMPONENT_IDS_PER_SERVER:-16}"
 SAMPLES="${SAMPLES:-5000}"
 T0="${T0:-1700000000}"          # timestamp of sample 0 (seconds)
 INTERVAL="${INTERVAL:-1}"        # seconds between samples (integer)
@@ -70,7 +70,7 @@ LIVE_TARGET="${LIVE_TARGET:-${DATA_NAME}_live}"
 LIVE_RATE="${LIVE_RATE:-2000}"   # records per second per server
 LIVE_BATCH="${LIVE_BATCH:-500}"
 LIVE_SAMPLES="${LIVE_SAMPLES:-1500}"
-LIVE_POLL="${LIVE_POLL:-2}"       # seconds between query-node polls
+LIVE_POLL="${LIVE_POLL:-2}"       # seconds between query-host polls
 
 # ---------------------------------------------------------------- launchers
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"

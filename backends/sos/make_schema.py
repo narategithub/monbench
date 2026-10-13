@@ -12,17 +12,18 @@ sos_attr() below -- SOS has no 8-bit integer type, so uint8/int8 are
 widened to the closest wider SOS integer type it does have (UINT16/
 INT16), and no bare "string" type, so a string attribute becomes a
 fixed-length SOS CHAR_ARRAY. No attribute is ever dropped from the
-template: every dataset-declared attribute, flat or per-kind, gets a
-same-named SOS attribute one way or another.
+template: every dataset-declared attribute, flat or in a list attribute's
+entries, gets a same-named SOS attribute one way or another.
 
-If the dataset declares component kinds (design/value-generation.md Sec
-6), OUT also gets one schema template per kind, named "<dataset_name>_<kind>"
-(the same naming convention backends/influxdb/writer/influx_write.py uses
-for its per-kind measurements) -- see convert_kind() and
-backends/sos/README.md's "Component-kind data model mapping". OUT is now a
-single JSON document shaping both:
+If the dataset declares list attributes (design/value-generation.md Sec
+6), OUT also gets one schema template per list attribute, named
+"<dataset_name>_<name>" (the same naming convention
+backends/influxdb/writer/influx_write.py uses for its per-list-attribute
+measurements) -- see convert_list() and backends/sos/README.md's "List
+attribute data model mapping". OUT is now a single JSON document shaping
+both:
 
-    {"node": <node schema template>, "components": {<kind>: <template>, ...}}
+    {"node": <node schema template>, "lists": {<name>: <template>, ...}}
 
 rather than a bare node template, since there is no backward-compatibility
 constraint on this pre-release suite (see design/value-generation.md Sec 3).
@@ -54,8 +55,8 @@ DEFAULT_STRING_LENGTH = 8
 def sos_attr(a):
     """One dataset-JSON attribute ({"name", "type", ...}) -> its SOS
     schema template entry ({"name", "type", ["size"]}). Shared by convert()
-    (flat/node attributes) and convert_kind() (a component kind's own
-    attributes) -- the mapping is identical either way."""
+    (flat/node attributes) and convert_list() (a list attribute's own
+    entry attributes) -- the mapping is identical either way."""
     entry = {"name": a["name"], "type": _SOS_TYPE[a["type"]]}
     if a["type"] == "string":
         # The template's "size" field is schema_from_template_obj()'s cue
@@ -69,7 +70,8 @@ def sos_attr(a):
 
 
 def convert(ds):
-    attrs = [sos_attr(a) for a in ds["attributes"]]
+    flat = [a for a in ds["attributes"] if a.get("type") != "list"]
+    attrs = [sos_attr(a) for a in flat]
     by_name = {a["name"]: a for a in attrs}
     for key in ds.get("keys", []):
         if len(key["attrs"]) == 1:
@@ -82,27 +84,35 @@ def convert(ds):
             "attrs": attrs}
 
 
-def convert_kind(ds, comp_kind):
-    """Schema template for one component kind (design doc Sec 6.5's SOS
-    mapping): one schema per kind, columns = the kind's own attributes
-    plus component_id/job_id/seq/component_index, joined back to the node
-    schema's rows on (component_id, timestamp) via the 'comp_time' join
-    attribute -- the same join key name and shape the node schema already
-    uses for its own comp_time key, so a native query can use it the same
-    way. 'timestamp' is carried on every instance (the node sample's own
-    timestamp) so a kind's rows can be ordered and joined without reading
-    the node schema at all.
+def convert_list(ds, list_attr):
+    """Schema template for one list attribute (design doc Sec 6.5's SOS
+    mapping): one schema per list attribute, columns = the list's own
+    entry attributes (a record entry's tuple fields, or a single "value"
+    column for a bare-scalar entry) plus component_id/job_id/seq/
+    entry_index, joined back to the node schema's rows on (component_id,
+    timestamp) via the 'comp_time' join attribute -- the same join key
+    name and shape the node schema already uses for its own comp_time
+    key, so a native query can use it the same way. 'timestamp' is
+    carried on every instance (the node sample's own timestamp) so a
+    list's rows can be ordered and joined without reading the node
+    schema at all.
     """
-    kind = comp_kind["kind"]
-    name = f"{ds['name']}_{kind}"
+    name = f"{ds['name']}_{list_attr['name']}"
     attrs = [
         {"name": "timestamp", "type": "TIMESTAMP", "index": {}},
         {"name": "component_id", "type": "UINT64", "index": {}},
         {"name": "job_id", "type": "UINT64"},
         {"name": "seq", "type": "UINT64"},
-        {"name": "component_index", "type": "UINT64"},
+        {"name": "entry_index", "type": "UINT64"},
     ]
-    attrs += [sos_attr(a) for a in comp_kind.get("attributes", [])]
+    entries = list_attr["entries"]
+    if entries.get("type") == "record":
+        attrs += [sos_attr(a) for a in entries.get("tuples", [])]
+    else:
+        # Bare-scalar entries have no field name of their own (the
+        # metric_name sentinel is "" -- see valuegen.py's evaluate());
+        # the schema column is just named "value".
+        attrs.append(sos_attr({**entries, "name": "value"}))
     attrs.append({"name": "comp_time", "type": "join",
                   "join_attrs": ["component_id", "timestamp"], "index": {}})
     return {"name": name,
@@ -111,9 +121,9 @@ def convert_kind(ds, comp_kind):
 
 
 def build_templates(ds):
+    list_attrs = [a for a in ds.get("attributes", []) if a.get("type") == "list"]
     return {"node": convert(ds),
-            "components": {ck["kind"]: convert_kind(ds, ck)
-                            for ck in ds.get("components", [])}}
+            "lists": {la["name"]: convert_list(ds, la) for la in list_attrs}}
 
 
 if __name__ == "__main__":

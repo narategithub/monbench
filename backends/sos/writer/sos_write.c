@@ -40,13 +40,14 @@
  * sos_value_s's sos_primary_u) -- unlike the CHAR_ARRAY path below, which
  * is still a best-effort guess.
  *
- * If the dataset declares component kinds (design/value-generation.md
- * Sec 6), each kind's instances are also written, one schema per kind --
- * see struct kind_writer below and backends/sos/README.md's
- * "Component-kind data model mapping". The scope above applies per kind
- * too: build_kind_writer() now writes a kind's signed-integer attributes
- * the same way the flat loop does, through the same set_value()
- * dispatcher, so no kind attribute is skipped any more.
+ * If the dataset declares list attributes (design/value-generation.md
+ * Sec 6), each one's entry instances are also written, one schema per
+ * list attribute -- see struct list_writer below and
+ * backends/sos/README.md's "List attribute data model mapping". The
+ * scope above applies per list attribute too: build_list_writer() now
+ * writes a list's signed-integer tuple fields (or bare-scalar entry) the
+ * same way the flat loop does, through the same set_value() dispatcher,
+ * so no list attribute's entry is skipped any more.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -64,12 +65,13 @@
 #include "dataset.h"
 
 #define MAX_JOIN_ATTRS 16
-/* Max component instances a single (comp, seq) sample can produce, across
- * every declared kind -- see write_component()'s caller in main(). Every
- * dataset JSON seen so far declares at most a handful per kind
- * (dataset/curated_metrics_like.json: 2 cpu + up to 4 netdev); this is
- * comfortably larger, with room for a kind declaring a wider count range. */
-#define MAX_COMPONENT_RECS 256
+/* Max entry instances a single (comp, seq) sample can produce, across
+ * every declared list attribute -- see write_list_entry()'s caller in
+ * main(). Every dataset JSON seen so far declares at most a handful per
+ * list attribute (dataset/curated_metrics_like.json: 2 cpu + up to 4
+ * netdev); this is comfortably larger, with room for a list attribute
+ * declaring a wider length range. */
+#define MAX_LIST_RECS 256
 
 struct opts {
 	const char *path;
@@ -144,7 +146,7 @@ static int lookup_type(const char *name, sos_type_t *type)
  *
  * Takes an already-parsed json_t* rather than loading its own file,
  * because the template file now holds more than one such object --
- * {"node": {...}, "components": {"<kind>": {...}, ...}} (see
+ * {"node": {...}, "lists": {"<name>": {...}, ...}} (see
  * backends/sos/make_schema.py) -- loaded once by main() into a single
  * json_t* tree that this function's caller slices up.
  */
@@ -234,8 +236,8 @@ out:
 
 /* Get or create, in *sos*, the schema described by the already-parsed
  * template object *tmpl* ({"name", "uuid", "attrs"}) -- used for both the
- * node schema (tmpl = root["node"]) and each component kind's schema
- * (tmpl = root["components"][kind]). */
+ * node schema (tmpl = root["node"]) and each list attribute's schema
+ * (tmpl = root["lists"][name]). */
 static sos_schema_t get_schema_obj(sos_t sos, json_t *tmpl)
 {
 	const char *name = json_string_value(json_object_get(tmpl, "name"));
@@ -379,16 +381,18 @@ static sos_attr_t must_attr(sos_schema_t schema, const char *name)
  * a SOS-INT16-via-int16, etc. */
 struct value_attr {
 	sos_attr_t sos_attr;
-	size_t idx;		/* index into dataset_t.attrs[] / ds_expected()'s values[] */
+	size_t idx;		/* index into dataset_t.attrs[] / ds_expected()'s values[],
+				 * or (for a list attribute's record entries) into
+				 * ds_list_t.tuples[] / a ds_list_rec_t's values[] */
 	const ds_attr_t *attr;
 };
 
 /* Write one resolved value attribute's value, dispatching on *da*'s
  * family and (for DS_FAMILY_UINT/DS_FAMILY_INT) exact declared width --
- * the single place both the flat write loop and write_component() go
+ * the single place both the flat write loop and write_list_entry() go
  * through, so the two can never diverge on how a given family/width is
  * written. Only ever called for a UINT/INT/DOUBLE/STRING attribute (see
- * the flat resolution loop in main() and build_kind_writer(), which are
+ * the flat resolution loop in main() and build_list_writer(), which are
  * what decide which families get a value_attr at all; DS_FAMILY_TIMESTAMP
  * never does, since the identity timestamp attribute is written directly
  * via set_ts(), not through this dispatcher). */
@@ -425,73 +429,89 @@ static void set_value(sos_obj_t obj, const ds_attr_t *da, sos_attr_t sa,
 	}
 }
 
-/* One component kind's schema plus everything needed to write one
+/* One list attribute's schema plus everything needed to write one entry
  * instance of it, built once from the loaded dataset_t and the matching
- * slice of the parsed template tree -- the per-kind analog of the flat
- * schema/value_attrs[] pair above. value_attrs here indexes into a
- * ds_component_rec_t's values[] (kind->attrs order), not dataset_t.attrs[]. */
-struct kind_writer {
+ * slice of the parsed template tree -- the per-list analog of the flat
+ * schema/value_attrs[] pair above. For a record-entries list,
+ * value_attrs indexes into a ds_list_rec_t's values[] in list->tuples
+ * order; for a bare-scalar-entries list, a_value/scalar_entry write the
+ * single "value" column from values[0] instead (see
+ * backends/sos/make_schema.py's convert_list()). */
+struct list_writer {
 	sos_schema_t schema;
 	sos_attr_t a_ts, a_comp, a_job, a_seq, a_idx;
+	int is_record;
 	struct value_attr value_attrs[DS_MAX_ATTRS];
 	size_t n_value_attrs;
+	sos_attr_t a_value;		/* !is_record only */
+	const ds_attr_t *scalar_entry;	/* !is_record only */
 };
 
-/* Resolve one component kind's schema and value attrs. *kind_tmpl* is
- * root["components"][kind->kind] from main()'s parsed template tree --
- * built by backends/sos/make_schema.py's convert_kind(), which gives
- * every attribute a real SOS type, signed integers included. Every kind
- * attribute gets a value_attr here and is written through set_value(),
- * the same dispatcher the flat loop uses. */
-static int build_kind_writer(sos_t sos, json_t *kind_tmpl, const ds_kind_t *kind,
-                              struct kind_writer *kw)
+/* Resolve one list attribute's schema and value attrs. *list_tmpl* is
+ * root["lists"][list->name] from main()'s parsed template tree -- built
+ * by backends/sos/make_schema.py's convert_list(), which gives every
+ * entry attribute a real SOS type, signed integers included. Every
+ * tuple field (or the bare-scalar "value" column) gets a value_attr
+ * here and is written through set_value(), the same dispatcher the flat
+ * loop uses. */
+static int build_list_writer(sos_t sos, json_t *list_tmpl, const ds_list_t *list,
+                              struct list_writer *lw)
 {
 	size_t ai;
 
-	kw->schema = get_schema_obj(sos, kind_tmpl);
-	if (!kw->schema)
+	lw->schema = get_schema_obj(sos, list_tmpl);
+	if (!lw->schema)
 		return -1;
-	kw->a_ts = must_attr(kw->schema, "timestamp");
-	kw->a_comp = must_attr(kw->schema, "component_id");
-	kw->a_job = must_attr(kw->schema, "job_id");
-	kw->a_seq = must_attr(kw->schema, "seq");
-	kw->a_idx = must_attr(kw->schema, "component_index");
+	lw->a_ts = must_attr(lw->schema, "timestamp");
+	lw->a_comp = must_attr(lw->schema, "component_id");
+	lw->a_job = must_attr(lw->schema, "job_id");
+	lw->a_seq = must_attr(lw->schema, "seq");
+	lw->a_idx = must_attr(lw->schema, "entry_index");
 
-	kw->n_value_attrs = 0;
-	for (ai = 0; ai < kind->n_attrs; ai++) {
-		const ds_attr_t *da = &kind->attrs[ai];
-		sos_attr_t sa;
-		sa = sos_schema_attr_by_name(kw->schema, da->name);
-		if (!sa)
-			continue;	/* defensive: should always be present */
-		kw->value_attrs[kw->n_value_attrs].sos_attr = sa;
-		kw->value_attrs[kw->n_value_attrs].idx = ai;
-		kw->value_attrs[kw->n_value_attrs].attr = da;
-		kw->n_value_attrs++;
+	lw->is_record = list->is_record;
+	lw->n_value_attrs = 0;
+	if (lw->is_record) {
+		for (ai = 0; ai < list->n_tuples; ai++) {
+			const ds_attr_t *da = &list->tuples[ai];
+			sos_attr_t sa = sos_schema_attr_by_name(lw->schema, da->name);
+			if (!sa)
+				continue;	/* defensive: should always be present */
+			lw->value_attrs[lw->n_value_attrs].sos_attr = sa;
+			lw->value_attrs[lw->n_value_attrs].idx = ai;
+			lw->value_attrs[lw->n_value_attrs].attr = da;
+			lw->n_value_attrs++;
+		}
+	} else {
+		lw->a_value = must_attr(lw->schema, "value");
+		lw->scalar_entry = &list->scalar_entry;
 	}
 	return 0;
 }
 
-/* Write one component instance (a ds_expected_components() record) into
- * its kind's schema -- the per-kind analog of the flat write loop's body
- * below. Returns sos_obj_index()'s rc (0 on success). */
-static int write_component(struct kind_writer *kw, uint64_t comp, uint64_t job_id,
-                            uint64_t seq, uint64_t ts, const ds_component_rec_t *rec)
+/* Write one entry instance (a ds_expected_lists() record) into its list
+ * attribute's schema -- the per-list analog of the flat write loop's
+ * body below. Returns sos_obj_index()'s rc (0 on success). */
+static int write_list_entry(struct list_writer *lw, uint64_t comp, uint64_t job_id,
+                             uint64_t seq, uint64_t ts, const ds_list_rec_t *rec)
 {
 	size_t vi;
-	sos_obj_t obj = sos_obj_new(kw->schema);
+	sos_obj_t obj = sos_obj_new(lw->schema);
 	if (!obj) {
-		fprintf(stderr, "error %d allocating component object\n", errno);
+		fprintf(stderr, "error %d allocating list object\n", errno);
 		return -1;
 	}
-	set_ts(obj, kw->a_ts, ts);
-	set_u64(obj, kw->a_comp, comp);
-	set_u64(obj, kw->a_job, job_id);
-	set_u64(obj, kw->a_seq, seq);
-	set_u64(obj, kw->a_idx, rec->index);
-	for (vi = 0; vi < kw->n_value_attrs; vi++) {
-		const struct value_attr *va = &kw->value_attrs[vi];
-		set_value(obj, va->attr, va->sos_attr, &rec->values[va->idx]);
+	set_ts(obj, lw->a_ts, ts);
+	set_u64(obj, lw->a_comp, comp);
+	set_u64(obj, lw->a_job, job_id);
+	set_u64(obj, lw->a_seq, seq);
+	set_u64(obj, lw->a_idx, rec->index);
+	if (lw->is_record) {
+		for (vi = 0; vi < lw->n_value_attrs; vi++) {
+			const struct value_attr *va = &lw->value_attrs[vi];
+			set_value(obj, va->attr, va->sos_attr, &rec->values[va->idx]);
+		}
+	} else {
+		set_value(obj, lw->scalar_entry, lw->a_value, &rec->values[0]);
 	}
 	int rc = sos_obj_index(obj);
 	sos_obj_put(obj);
@@ -569,10 +589,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	/* The template file now holds the node schema plus one schema per
-	 * declared component kind (see backends/sos/make_schema.py's
-	 * build_templates()): {"node": {...}, "components": {<kind>: {...}}}.
+	 * declared list attribute (see backends/sos/make_schema.py's
+	 * build_templates()): {"node": {...}, "lists": {<name>: {...}}}.
 	 * Loaded once here into a single parsed tree; get_schema_obj()/
-	 * build_kind_writer() below take slices of it directly rather than
+	 * build_list_writer() below take slices of it directly rather than
 	 * each re-opening the file. */
 	json_error_t tmpl_jerr;
 	json_t *tmpl_root = json_load_file(o.template_path, 0, &tmpl_jerr);
@@ -582,7 +602,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	json_t *node_tmpl = json_object_get(tmpl_root, "node");
-	json_t *components_tmpl = json_object_get(tmpl_root, "components");
+	json_t *lists_tmpl = json_object_get(tmpl_root, "lists");
 	if (!node_tmpl) {
 		fprintf(stderr, "error: %s: missing 'node'\n", o.template_path);
 		return 1;
@@ -617,24 +637,24 @@ int main(int argc, char **argv)
 		n_value_attrs++;
 	}
 
-	/* Resolve each declared component kind's schema and value attrs
+	/* Resolve each declared list attribute's schema and value attrs
 	 * once, up front, same as the flat attrs above -- see struct
-	 * kind_writer and build_kind_writer(). */
-	struct kind_writer kind_writers[DS_MAX_KINDS];
-	size_t ki;
-	for (ki = 0; ki < ds.n_kinds; ki++) {
-		const ds_kind_t *kind = &ds.kinds[ki];
-		json_t *kind_tmpl = components_tmpl
-			? json_object_get(components_tmpl, kind->kind) : NULL;
-		if (!kind_tmpl) {
+	 * list_writer and build_list_writer(). */
+	struct list_writer list_writers[DS_MAX_LISTS];
+	size_t li;
+	for (li = 0; li < ds.n_lists; li++) {
+		const ds_list_t *list = &ds.lists[li];
+		json_t *list_tmpl = lists_tmpl
+			? json_object_get(lists_tmpl, list->name) : NULL;
+		if (!list_tmpl) {
 			fprintf(stderr,
-				"error: %s: 'components' has no template for kind '%s' "
-				"(DATASET and the template file must come from the "
-				"same dataset JSON, via make_schema.py)\n",
-				o.template_path, kind->kind);
+				"error: %s: 'lists' has no template for list attribute "
+				"'%s' (DATASET and the template file must come from "
+				"the same dataset JSON, via make_schema.py)\n",
+				o.template_path, list->name);
 			return 1;
 		}
-		if (build_kind_writer(sos, kind_tmpl, kind, &kind_writers[ki]))
+		if (build_list_writer(sos, list_tmpl, list, &list_writers[li]))
 			return 1;
 	}
 
@@ -680,28 +700,28 @@ int main(int argc, char **argv)
 			}
 			written++;
 
-			if (ds.n_kinds) {
-				static ds_component_rec_t comp_recs[MAX_COMPONENT_RECS];
-				int n_recs = ds_expected_components(
+			if (ds.n_lists) {
+				static ds_list_rec_t list_recs[MAX_LIST_RECS];
+				int n_recs = ds_expected_lists(
 					&ds, comp, values[idx_job].u64, seq,
-					comp_recs, MAX_COMPONENT_RECS);
+					list_recs, MAX_LIST_RECS);
 				int ri;
 				if (n_recs < 0) {
 					fprintf(stderr,
-						"error: record %" PRIu64 ": more than %d component "
-						"instances; raise MAX_COMPONENT_RECS\n",
-						written, MAX_COMPONENT_RECS);
+						"error: record %" PRIu64 ": more than %d list "
+						"entry instances; raise MAX_LIST_RECS\n",
+						written, MAX_LIST_RECS);
 					return 1;
 				}
 				for (ri = 0; ri < n_recs; ri++) {
-					const ds_component_rec_t *rec = &comp_recs[ri];
-					/* rec->kind points into ds.kinds[] (see
-					 * ds_expected_components() in core/dataset.c),
-					 * so its offset from ds.kinds is that kind's
-					 * index into kind_writers[], built in the same
-					 * order above. */
-					size_t kwi = (size_t)(rec->kind - ds.kinds);
-					rc = write_component(&kind_writers[kwi], comp,
+					const ds_list_rec_t *rec = &list_recs[ri];
+					/* rec->list points into ds.lists[] (see
+					 * ds_expected_lists() in core/dataset.c),
+					 * so its offset from ds.lists is that list
+					 * attribute's index into list_writers[],
+					 * built in the same order above. */
+					size_t lwi = (size_t)(rec->list - ds.lists);
+					rc = write_list_entry(&list_writers[lwi], comp,
 						values[idx_job].u64, seq,
 						values[idx_ts].u64, rec);
 					if (rc) {
@@ -710,7 +730,7 @@ int main(int argc, char **argv)
 							fprintf(stderr,
 								"error %d indexing %s[%" PRIu64 "] "
 								"for record %" PRIu64 "\n",
-								rc, rec->kind->kind, rec->index, written);
+								rc, rec->list->name, rec->index, written);
 					}
 				}
 			}

@@ -13,7 +13,7 @@ output formats) are in `README.md`, "Assumptions and limits".
 - **Out of scope** — deliberately not covered by the suite.
 - **Done** — completed; kept for the record of why.
 
-Last updated: 2026-10-12
+Last updated: 2026-10-13
 
 ---
 
@@ -24,7 +24,7 @@ Last updated: 2026-10-12
     * `core/dataset.py` builds every expected record as a Python tuple before verifying.
     * Works for millions of records; fails on memory and time for billions.
   * Options:
-    * Compute each query's expected answer as one `seq` range per component. Every supported condition narrows the components or a `seq` range, so cost grows with the number of components, not records.
+    * Compute each query's expected answer as one `seq` range per node. Every supported condition narrows the nodes or a `seq` range, so cost grows with the number of nodes, not records.
     * For very large results, verify the exact row count plus a sample of rows instead of every row.
   * Status: **Suggested improvement.** About half a day. Best done before other backends depend on the current verifier.
 
@@ -54,7 +54,7 @@ Last updated: 2026-10-12
 
 * **Scale not yet demonstrated**
   * Current limitation:
-    * Tested on 2–3 nodes and up to 160,000 records. The node count itself is unrestricted (`SERVER_NODES`).
+    * Tested on 2–3 nodes and up to 160,000 records. The server count itself is unrestricted (`SERVER_HOSTS`).
   * Options:
     * Run on a large cluster once the scale items above are addressed.
   * Status: **Deferred** until the scale items above are addressed.
@@ -125,21 +125,21 @@ Last updated: 2026-10-12
   * Current limitation:
     * `match.where` supports `attribute op number` and, as of the
       value-generation refactor (`design/value-generation.md` Sec 6.5),
-      two more condition forms generic over any declared component kind:
-      `kind[i].attr op value` / `kind[*].attr op value` (indexed and
-      existential) and `count(kind) op n` (cardinality) — see
+      two more condition forms generic over any declared list attribute:
+      `name[i].attr op value` / `name[*].attr op value` (indexed and
+      existential) and `count(name) op n` (cardinality) — see
       `core/bench.py`'s `parse_match()`/`record_matches()` and
       `queries/curated_metrics.json` for worked examples.
     * Still missing: `or`, aggregates, and grouping. Such queries run
       unverified (INFO) or with `"verify": false`.
   * Options:
     * Extend the condition grammar further; add expected results for aggregates.
-  * Status: **Deferred** (for `or`/aggregates/grouping). The component-kind
+  * Status: **Deferred** (for `or`/aggregates/grouping). The list-attribute
     forms above are **Done**.
 
 * **No aggregation, downsampling or derivative queries**
   * Current limitation:
-    * Grafana-style questions (averages per time bin, rates of change, latest value per component) are not in the default set.
+    * Grafana-style questions (averages per time bin, rates of change, latest value per node) are not in the default set.
     * DSOS binning syntax is unknown; the `group_by` syntax is a guess.
     * DSOS returns partial group rows per server, which the client must combine.
   * Options:
@@ -154,12 +154,12 @@ Last updated: 2026-10-12
 * **One data shape authored so far**
   * Current limitation:
     * Only the default monitoring shape (`dataset/default.json`) and the
-      component-kind worked example (`dataset/curated_metrics_like.json`)
+      list-attribute worked example (`dataset/curated_metrics_like.json`)
       exist.
     * Previously this item also covered the value rules being hardcoded
       Python/C code; that part is **done** — the value-generation
       refactor (`design/value-generation.md`) made every value rule
-      (including component-kind generation) a pure function of a
+      (including list-attribute generation) a pure function of a
       dataset's own JSON declaration, computed by the shared
       `core/valuegen.py`/`.c`. Defining a new dataset, flat or nested,
       needs no change to `core/dataset.py`, `core/valuegen.py`, or any
@@ -186,29 +186,29 @@ Last updated: 2026-10-12
   * Resolution:
     * Rather than the "wide columns" option previously recommended here,
       this was implemented as **true nested records** — generic
-      **component kinds** (`design/value-generation.md` Sec 6): a dataset
-      declares zero or more component kinds, each a flat record with a
-      variable, per-sample instance count, one level of nesting below the
-      node. `dataset/curated_metrics_like.json`'s `cpu` and `netdev` kinds
-      are the worked example, modeled directly on `curated_metrics`'s own
-      per-core/per-interface records.
+      **list attributes** (`design/value-generation.md` Sec 6): a dataset
+      declares zero or more list attributes, each a flat record with a
+      variable, per-sample entry count, one level of nesting below the
+      node. `dataset/curated_metrics_like.json`'s `cpu` and `netdev` list
+      attributes are the worked example, modeled directly on
+      `curated_metrics`'s own per-core/per-interface records.
     * Generation (`core/valuegen.py`/`.c`) and verification
-      (`core/bench.py`'s `kind[i].attr`/`kind[*].attr`/`count(kind)`
+      (`core/bench.py`'s `name[i].attr`/`name[*].attr`/`count(name)`
       condition grammar) are implemented and backend-neutral. Backend
-      schema mapping and native `kind[i]`/`kind[*]` queries are
+      schema mapping and native `name[i]`/`name[*]` queries are
       implemented for `influxdb`, `sos` and `dsos` (see each backend's
-      README.md, "Component-kind data model mapping", and
-      `queries/curated_metrics.json`); `count(kind)` is native only on
+      README.md, "List attribute data model mapping", and
+      `queries/curated_metrics.json`); `count(name)` is native only on
       `influxdb` (see `STATUS.md`).
     * Not yet done: smoke-testing any of this against real SOS/DSOS/
       InfluxDB servers (`STATUS.md`'s "Suggested next step"), and the
-      "true nested records within a component" extension (`component →
-      sub-component[]`) that `design/value-generation.md` Sec 6.6
-      explicitly leaves out of scope.
+      "a list attribute whose entries themselves need to be lists"
+      extension that `design/value-generation.md` Sec 6.6 explicitly
+      leaves out of scope.
   * Status: **Done** (generation, verification, and backend mapping for
-    one level of component nesting). The two-level-nesting
-    (sub-component) extension remains **Out of scope** (design doc
-    Sec 6.6); real-server smoke-testing is tracked in `STATUS.md`.
+    one level of list nesting). The entries-containing-nested-lists
+    extension remains **Out of scope** (design doc Sec 6.6); real-server
+    smoke-testing is tracked in `STATUS.md`.
 
 * **No support for existing data from other sources**
   * Current limitation:
@@ -289,6 +289,30 @@ Last updated: 2026-10-12
     * Name checks: not on PyPI. On GitHub, `Wilfred2002/MonBench` is a personal repository in an unrelated field (a Monad blockchain app template, no description or stars). GitHub names are per owner, so it does not block `ovis-hpc/monbench`.
     * Similar names exist: `benchmon` (an HPC resource monitor from the SKA project) and `moonbench` (a MoonBit benchmarking toolkit).
   * Status: **Done** in this version.
+
+* **Vocabulary cleanup: "component" de-overloaded into "node" and "list attribute"**
+  * Reason:
+    * The suite's first value-generation design overloaded **component**
+      for two unrelated things: `component_id` (a reserved LDMS name for
+      the monitored node) and a separate "component kind" concept for
+      per-sample nested lists (e.g. per-CPU, per-interface records).
+      `design/value-generation.md` §2 and §7 item 4 work through the
+      history; the short version is that `component_id` keeps its name
+      (it is fixed by LDMS convention), while the second meaning is
+      eliminated outright — a nested list is now just an attribute with
+      `"type": "list"`, identified by its own `name` like any other
+      attribute, with no separate `kind` field.
+    * The shell/config layer had its own, backwards version of the same
+      ambiguity: `SERVER_NODES`/`COMPONENTS_PER_NODE`/`QUERY_NODE` used
+      "node" to mean the *physical writer machine* — the opposite of what
+      "node" means everywhere else in this vocabulary (`component_id`).
+      Renamed to `SERVER_HOSTS`/`COMPONENT_IDS_PER_SERVER`/`QUERY_HOST` so
+      "host"/"server" consistently means the writer machine and "node"
+      consistently means the monitored entity.
+  * Status: **Done.** Propagated across `core/valuegen.py`/`.h`/`.c`,
+    `core/dataset.py`/`.h`/`.c`, `core/bench.py`, every `dataset/*.json`
+    and `queries/*.json` file, each backend's writer/query code and
+    README, the shell/config layer, and this document and `STATUS.md`.
 
 ---
 

@@ -11,12 +11,12 @@ fields, their line-protocol encoding (integer/float/string) taken from
 each attribute's declared type, so a dataset with different or additional
 attributes needs no change here.
 
-If the dataset declares component kinds (design/value-generation.md Sec
-6), each kind's instances are also written, one measurement per kind
-named "<measurement>_<kind>" -- see component_lines() below and
-backends/influxdb/README.md's "Component-kind data model mapping" for
-the exact tag/field layout. A dataset with no "components" (e.g. the
-default data set) writes exactly as before.
+If the dataset declares list attributes (design/value-generation.md Sec
+6), each one's entry instances are also written, one measurement per
+list attribute named "<measurement>_<name>" -- see list_lines() below
+and backends/influxdb/README.md's "List attribute data model mapping"
+for the exact tag/field layout. A dataset with no list attributes (e.g.
+the default data set) writes exactly as before.
 
 Two interfaces, chosen by --interface:
   python  the influxdb_client_3 library (batched writes)
@@ -82,8 +82,7 @@ def _field(name, v, attr_type):
     """One name=value line-protocol field, encoded per its declared type:
     integer types get the 'i' suffix, string types are quoted, everything
     else (double) is a bare float. Shared by line() (flat attributes) and
-    component_lines() (component-kind attributes) so the two encode
-    identically."""
+    list_lines() (list-attribute entries) so the two encode identically."""
     if attr_type in _INT_TYPES:
         return f"{name}={int(v)}i"
     if attr_type == "string":
@@ -105,38 +104,43 @@ def line(measurement, comp, seq, values, ds):
             f"{','.join(fields)} {ts}")
 
 
-def component_lines(measurement_base, comp, seq, values, ds):
-    """Line-protocol records for every component-kind instance at this
-    sample (design/value-generation.md Sec 6), one measurement per kind
-    named "<measurement_base>_<kind>" -- see
-    backends/influxdb/README.md's component-kind mapping table.
+def list_lines(measurement_base, comp, seq, values, ds):
+    """Line-protocol records for every list-attribute entry instance at
+    this sample (design/value-generation.md Sec 6), one measurement per
+    list attribute named "<measurement_base>_<name>" -- see
+    backends/influxdb/README.md's list attribute mapping table.
 
-    Tags: component_id, job_id, component_index (the design doc's
-    node_id/job_id/component_index). Fields: the kind's own attributes,
-    plus seq (kept, like the flat measurement's seq field, so a component
-    row can be tied back to the sample it belongs to without relying on
-    point time alone). Point time is the same timestamp as the node
-    sample this component instance belongs to, so a native query can join
-    a component measurement back to the flat one on (component_id, time)
-    -- it already uniquely identifies (component_id, seq), and job_id is
-    a deterministic function of seq, so it never disagrees with that
-    join.
+    Tags: component_id, job_id, entry_index (the design doc's
+    node_id/job_id/entry_index). Fields: the list's own entry attributes
+    (a record entry's tuple fields, or a single "value" field for a
+    bare-scalar entry), plus seq (kept, like the flat measurement's seq
+    field, so an entry row can be tied back to the sample it belongs to
+    without relying on point time alone). Point time is the same
+    timestamp as the node sample this entry instance belongs to, so a
+    native query can join an entry measurement back to the flat one on
+    (component_id, time) -- it already uniquely identifies
+    (component_id, seq), and job_id is a deterministic function of seq,
+    so it never disagrees with that join.
 
-    Returns an empty list for a dataset with no declared component kinds
+    Returns an empty list for a dataset with no declared list attributes
     (e.g. the default data set), so callers need no special-casing.
     """
     job_id = values["job_id"]
     ts = int(values["timestamp"])
     lines = []
-    for rec in ds.expected_components(comp, seq):
-        kind = rec["kind"]
-        measurement = f"{measurement_base}_{kind}"
+    for rec in ds.expected_lists(comp, seq):
+        name = rec["list"]
+        la = ds.list_attr(name)
+        measurement = f"{measurement_base}_{name}"
         fields = [f"seq={seq}i"]
-        for attr in ds.component_kind(kind)["attributes"]:
-            name = attr["name"]
-            fields.append(_field(name, rec[name], ds.component_attr_type(kind, name)))
+        if la["entries"].get("type") == "record":
+            for tup in la["entries"].get("tuples", []):
+                fname = tup["name"]
+                fields.append(_field(fname, rec[fname], ds.list_tuple_type(name, fname)))
+        else:
+            fields.append(_field("value", rec["value"], ds.list_tuple_type(name)))
         lines.append(f"{measurement},component_id={comp},job_id={job_id},"
-                     f"component_index={rec['index']} {','.join(fields)} {ts}")
+                     f"entry_index={rec['index']} {','.join(fields)} {ts}")
     return lines
 
 
@@ -190,22 +194,22 @@ def main():
     # hardcoded name list, so a different or expanded dataset needs no
     # change here.
     ds = Dataset(Dataset.load_definition(os.environ["DATASET"]),
-                partitions=1, components=a.components, samples=a.samples,
+                partitions=1, component_ids=a.components, samples=a.samples,
                 t0=a.t0, interval=a.interval, job_len=a.job_len)
     writer = HttpWriter(a) if a.interface == "http" else PythonWriter(a)
 
     # 'written' counts node-level samples only (what DS.size() and every
     # other writer's "records" field count), even though buf also carries
-    # each sample's component-kind lines -- a dataset with component
-    # kinds sends more lines than 'written' implies, but 'written' stays
-    # comparable across backends and across datasets with or without
-    # component kinds.
+    # each sample's list-attribute lines -- a dataset with list
+    # attributes sends more lines than 'written' implies, but 'written'
+    # stays comparable across backends and across datasets with or
+    # without list attributes.
     written = 0
     buf = []
     t_start = time.monotonic()
     for comp, seq, values in records(a, ds):
         buf.append(line(a.measurement, comp, seq, values, ds))
-        buf.extend(component_lines(a.measurement, comp, seq, values, ds))
+        buf.extend(list_lines(a.measurement, comp, seq, values, ds))
         written += 1
         if len(buf) >= a.batch:
             writer.write(buf)

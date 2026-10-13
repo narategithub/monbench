@@ -13,7 +13,7 @@ single-node or shared-filesystem comparison point.
 | Query | Yes, directly on disk (containers must be accessible from the query node) |
 | Partitioning | Each server writes partition *i* of the data set to its own container |
 | Service | None; SOS is a library, no daemon needed for writing or querying |
-| Component kinds (design/value-generation.md Sec 6) | Yes -- see "Component-kind data model mapping" below |
+| List attributes (design/value-generation.md Sec 6) | Yes -- see "List attribute data model mapping" below |
 
 Common configurations:
 
@@ -48,40 +48,40 @@ The C writer is built by `bin/run.sh build`; the Python writer needs the
 The `sos` adapter speaks the same query language (dialect `dsos`) as the
 `dsos` backend's adapters, so they share the query strings in a query set.
 
-## Component-kind data model mapping
+## List attribute data model mapping
 
-A dataset may also declare component kinds (design/value-generation.md
+A dataset may also declare list attributes (design/value-generation.md
 Sec 6) -- see `dataset/curated_metrics_like.json`'s `cpu`/`netdev` for a
 worked example. Following the design doc's Sec 6.5 SOS mapping table,
-each declared kind gets its own schema, generic over however many kinds a
-dataset declares:
+each declared list attribute gets its own schema, generic over however
+many list attributes a dataset declares:
 
-| Component kind | SOS |
+| List attribute | SOS |
 |---|---|
-| kind name | schema `{schema}_<kind>` (e.g. `monitoring_nested_cpu`), built by `make_schema.py`'s `convert_kind()` |
-| `component_id`, `job_id`, `seq`, `component_index` | plain attributes (`component_id` and `timestamp` indexed) |
-| the kind's own attributes | plain attributes, same type mapping as the node schema (see "Scope" below) |
+| attribute name | schema `{schema}_<name>` (e.g. `monitoring_nested_cpu`), built by `make_schema.py`'s `convert_list()` |
+| `component_id`, `job_id`, `seq`, `entry_index` | plain attributes (`component_id` and `timestamp` indexed) |
+| the list's own entry attributes (a record entry's tuple fields, or a single `value` column for a bare-scalar entry) | plain attributes, same type mapping as the node schema (see "Scope" below) |
 | `timestamp` of the node sample this instance belongs to | the `timestamp` attribute, indexed; also joined with `component_id` into a `comp_time` JOIN attribute, the same shape and name the node schema's own `comp_time` key already uses |
 
 This is the same shape the node schema already uses -- one schema per
-declared `kind` rather than hardcoded ones for `cpu`/`netdev`.
-`sos_write.py`/`sos_write.c` write every component instance
-(`Dataset.expected_components()` / `ds_expected_components()`) into its
-kind's schema alongside the node record for the same sample.
+declared list attribute rather than hardcoded ones for `cpu`/`netdev`.
+`sos_write.py`/`sos_write.c` write every entry instance
+(`Dataset.expected_lists()` / `ds_expected_lists()`) into its list
+attribute's schema alongside the node record for the same sample.
 
 Querying: the SOS query language has no JOIN, so a native
-`kind[i].attr`/`kind[*].attr` query (design doc Sec 6.5) selects directly
-from the kind's own schema rather than joining it back to the node
-schema in the query text -- e.g. `select component_id, job_id, seq,
+`name[i].attr`/`name[*].attr` query (design doc Sec 6.5) selects directly
+from the list attribute's own schema rather than joining it back to the
+node schema in the query text -- e.g. `select component_id, job_id, seq,
 timestamp from {schema}_cpu where idle < 50 order_by timestamp`. That
-alone answers the indexed form (`kind[i].attr`; one instance per node
+alone answers the indexed form (`name[i].attr`; one instance per node
 sample per fixed index is already unique). The existential form
-(`kind[*].attr`) can return more than one row per node sample when more
+(`name[*].attr`) can return more than one row per node sample when more
 than one instance matches; `sos_query.py`'s `postprocess()` collapses
 those into one row, the effect InfluxDB's native `SELECT DISTINCT ...
 JOIN ...` gets from its own query language. See
 `queries/curated_metrics.json`'s `"dsos"` entries for worked examples.
-`count(kind)` has **no native query here** -- the SOS query language has
+`count(name)` has **no native query here** -- the SOS query language has
 no `GROUP BY`/`HAVING`-style count filter -- so that condition still
 reports SKIP under this backend (see `STATUS.md`).
 
@@ -91,7 +91,7 @@ CHAR_ARRAY, and `uint8`/`int8` widen to the closest wider SOS integer
 type (`UINT16`/`INT16`) since SOS has no 8-bit integer type. `sos_write.c`
 writes every family, signed integers of every width included
 (`int8`/`int16`/`int32`/`int64`, via `set_value()`'s `DS_FAMILY_INT`
-case), flat and per component kind alike -- nothing is dropped or
+case), flat and list-attribute entries alike -- nothing is dropped or
 unsupported at the writer level any more. The remaining caveat is that
 this has not been built or smoke-tested against a real SOS install in
 any environment that produced this code (no `libsos`/`libods` available

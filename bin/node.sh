@@ -71,7 +71,7 @@ cmd_write() { # WRITER TARGET MODE INDEX ID
 		samples="${LIVE_SAMPLES:-}" batch="${LIVE_BATCH:-}" rate="${LIVE_RATE:-}"
 	fi
 	# Data-set arguments every writer accepts (see backends/README.md).
-	dataset_args=(--components "${COMPONENTS_PER_NODE:-}" --samples "$samples"
+	dataset_args=(--components "${COMPONENT_IDS_PER_SERVER:-}" --samples "$samples"
 		--t0 "${T0:-}" --interval "${INTERVAL:-}" --job-len "${JOB_LEN:-}"
 		--batch "$batch" --rate "$rate")
 	mkdir -p "${RESULTS_DIR:-}"

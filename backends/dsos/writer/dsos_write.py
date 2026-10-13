@@ -17,11 +17,11 @@ imports core/dataset.py and calls Dataset.expected() for every record,
 the same as sos_write.py and sos_write.c, so that containers written by
 any of the three answer every query identically.
 
-If the dataset declares component kinds (design/value-generation.md Sec
-6), each kind's instances are also written through the same dsosd
-session, one schema per kind -- see sos_write.py's KindWriter (mirrored
-here) and backends/sos/README.md's "Component-kind data model mapping".
-Every attribute type maps onto a real SOS schema type
+If the dataset declares list attributes (design/value-generation.md Sec
+6), each one's entry instances are also written through the same dsosd
+session, one schema per list attribute -- see sos_write.py's ListWriter
+(mirrored here) and backends/sos/README.md's "List attribute data model
+mapping". Every attribute type maps onto a real SOS schema type
 (backends/sos/make_schema.py's sos_attr()): a string attribute is
 written as the fixed-length CHAR_ARRAY the template declares, and an
 unsigned 8/16/32/64-bit attribute is written as a plain Python int into
@@ -69,38 +69,51 @@ def get_schema(cont, tmpl, Sos):
     return schema
 
 
-class KindWriter:
-    """Mirrors sos_write.py's KindWriter -- one component kind's schema
-    plus the attr-name -> attr-id map needed to write an instance.
-    *attr_names* is the kind's declared attributes that the per-kind
-    template has a same-named SOS attribute for (every one of them, in
-    practice -- see make_schema.py's sos_attr())."""
-    def __init__(self, cont, tmpl, ds, kind, Sos):
+class ListWriter:
+    """Mirrors sos_write.py's ListWriter -- one list attribute's schema
+    plus the attr-name -> attr-id map needed to write an entry instance.
+    For a record-entries list, *attr_names* is its declared tuple fields
+    that the per-list template has a same-named SOS attribute for (every
+    one of them, in practice -- see make_schema.py's sos_attr()). For a
+    bare-scalar-entries list, there is a single "value" column instead
+    (make_schema.py's convert_list())."""
+    def __init__(self, cont, tmpl, ds, name, Sos):
         self.schema = get_schema(cont, tmpl, Sos)
         self.attr_ids = {n: self.schema.attr_by_name(n).attr_id()
                          for n in ("timestamp", "component_id", "job_id",
-                                   "seq", "component_index")}
-        self.attr_names = [a["name"] for a in ds.component_kind(kind)["attributes"]
-                           if self.schema.attr_by_name(a["name"]) is not None]
+                                   "seq", "entry_index")}
+        la = ds.list_attr(name)
+        self.is_record = la["entries"].get("type") == "record"
+        if self.is_record:
+            self.attr_names = [a["name"] for a in la["entries"].get("tuples", [])
+                               if self.schema.attr_by_name(a["name"]) is not None]
+        else:
+            self.attr_names = ["value"]
         for n in self.attr_names:
             self.attr_ids[n] = self.schema.attr_by_name(n).attr_id()
 
-    def write(self, comp, job_id, seq, ts, rec, ds, kind):
+    def _set(self, obj, attr_name, t, v):
+        aid = self.attr_ids[attr_name]
+        if t == "double":
+            obj[aid] = float(v)
+        elif t == "string":
+            obj[aid] = str(v)
+        else:
+            obj[aid] = int(v)
+
+    def write(self, comp, job_id, seq, ts, rec, ds, name):
         obj = self.schema.alloc()
         obj[self.attr_ids["timestamp"]] = (int(ts), 0)
         obj[self.attr_ids["component_id"]] = int(comp)
         obj[self.attr_ids["job_id"]] = int(job_id)
         obj[self.attr_ids["seq"]] = int(seq)
-        obj[self.attr_ids["component_index"]] = int(rec["index"])
-        for name in self.attr_names:
-            v = rec[name]
-            t = ds.component_attr_type(kind, name)
-            if t == "double":
-                obj[self.attr_ids[name]] = float(v)
-            elif t == "string":
-                obj[self.attr_ids[name]] = str(v)
-            else:
-                obj[self.attr_ids[name]] = int(v)
+        obj[self.attr_ids["entry_index"]] = int(rec["index"])
+        if self.is_record:
+            for attr_name in self.attr_names:
+                self._set(obj, attr_name, ds.list_tuple_type(name, attr_name),
+                          rec[attr_name])
+        else:
+            self._set(obj, "value", ds.list_tuple_type(name), rec["value"])
         rc = obj.index_add()
         obj.release()
         return rc
@@ -119,7 +132,7 @@ def main():
     # template only needs to have a same-named, same-typed attribute for
     # each one. This is what lets a new dataset need no change here.
     ds = Dataset(Dataset.load_definition(os.environ["DATASET"]),
-                partitions=1, components=a.components, samples=a.samples,
+                partitions=1, component_ids=a.components, samples=a.samples,
                 t0=a.t0, interval=a.interval, job_len=a.job_len)
 
     t_start = time.monotonic()
@@ -130,8 +143,8 @@ def main():
 
     schema = get_schema(cont, template["node"], Sos)
     attr_ids = {n: schema.attr_by_name(n).attr_id() for n in ds.attr_names}
-    kind_writers = {kind: KindWriter(cont, template["components"][kind], ds, kind, Sos)
-                    for kind in template["components"]}
+    list_writers = {name: ListWriter(cont, template["lists"][name], ds, name, Sos)
+                    for name in template["lists"]}
 
     base = (a.node_index + 1) * 1000
     written = errors = in_batch = 0
@@ -162,14 +175,14 @@ def main():
                     print(f"error {rc} indexing record {written}",
                           file=sys.stderr)
             written += 1
-            for rec in ds.expected_components(comp, seq):
-                rc = kind_writers[rec["kind"]].write(
+            for rec in ds.expected_lists(comp, seq):
+                rc = list_writers[rec["list"]].write(
                     comp, values["job_id"], seq, values["timestamp"],
-                    rec, ds, rec["kind"])
+                    rec, ds, rec["list"])
                 if rc:
                     errors += 1
                     if errors <= 10:
-                        print(f"error {rc} indexing {rec['kind']}[{rec['index']}] "
+                        print(f"error {rc} indexing {rec['list']}[{rec['index']}] "
                               f"for record {written}", file=sys.stderr)
             in_batch += 1
             if in_batch == a.batch:

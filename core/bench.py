@@ -49,7 +49,7 @@ QUERY_BACKEND = os.environ.get("QUERY_BACKEND", BACKEND)
 WRITE_BACKEND = os.environ.get("WRITE_BACKEND", BACKEND)
 # Backends whose data this query backend can read (from its <name>_backend.conf).
 PLUGIN_READS = os.environ.get("PLUGIN_READS", "").split()
-SERVERS = env("SERVER_NODES").split()
+SERVERS = env("SERVER_HOSTS").split()
 RUN_DIR = env("RUN_DIR")
 RESULTS_DIR = env("RESULTS_DIR")
 LIMIT_N = env("LIMIT_N", int)
@@ -114,11 +114,11 @@ def validate_rows(rows):
     for exact equality, strings for exact equality), so a custom or
     expanded data set is validated without code changes here. This checks
     values *within* an already-returned flat row; it does not validate
-    component-level attribute values, since no backend schema maps a
-    component kind onto a returned row yet (design/value-generation.md
-    Sec 6.5's backend-mapping table). Filtering a query's expected result
-    set by a component-level condition (kind[i].attr / kind[*].attr /
-    count(kind)) is separate and is handled by record_matches()/verify().
+    list-attribute entry values, since no backend schema maps a list
+    attribute onto a returned row yet (design/value-generation.md Sec
+    6.5's backend-mapping table). Filtering a query's expected result set
+    by a list-attribute condition (name[i].attr / name[*].attr /
+    count(name)) is separate and is handled by record_matches()/verify().
     Returns (problems, keys, warnings); keys lists (component_id, seq) for
     each row.
     """
@@ -127,12 +127,12 @@ def validate_rows(rows):
     check_names = [n for n in DS.attr_names if n not in IDENTITY_ATTRS]
     for n, r in enumerate(rows):
         try:
-            comp, seq = int(r["component_id"]), int(r["seq"])
+            cid, seq = int(r["component_id"]), int(r["seq"])
         except (KeyError, ValueError, TypeError):
             problems.append(f"row {n}: missing component_id/seq: {r}")
             continue
-        keys.append((comp, seq))
-        exp = DS.expected(comp, seq)
+        keys.append((cid, seq))
+        exp = DS.expected(cid, seq)
         for name in check_names:
             if name not in r:
                 continue
@@ -180,10 +180,11 @@ CMP = r"==|!=|<=|>=|<|>"
 # same comparison form as a number).
 VALUE = r"-?[\d.]+|'[^']*'|\"[^\"]*\""
 NODE_COND_RE = re.compile(rf"^\(?\s*(\w+)\s*({CMP})\s*({VALUE})\s*\)?$")
-# kind[i].attr cmp value / kind[*].attr cmp value -- Sec 6.5's comp_cond.
-COMP_COND_RE = re.compile(rf"^\(?\s*(\w+)\[(\d+|\*)\]\.(\w+)\s*({CMP})\s*({VALUE})\s*\)?$")
-# count(kind) cmp n -- Sec 6.5's count_cond. Always an integer comparison.
-COUNT_COND_RE = re.compile(rf"^\(?\s*count\((\w+)\)\s*({CMP})\s*(-?\d+)\s*\)?$")
+# name[i].attr cmp value / name[*].attr cmp value -- Sec 6.5's list_cond.
+# .attr is optional (a bare-scalar list's entry is the value itself).
+LIST_COND_RE = re.compile(rf"^\(?\s*(\w+)\[(\d+|\*)\](?:\.(\w+))?\s*({CMP})\s*({VALUE})\s*\)?$")
+# count(name) cmp n -- Sec 6.5's length_cond. Always an integer comparison.
+LENGTH_COND_RE = re.compile(rf"^\(?\s*count\((\w+)\)\s*({CMP})\s*(-?\d+)\s*\)?$")
 
 
 def parse_cond_value(raw):
@@ -214,16 +215,17 @@ def parse_match(match):
     Returns (spec, reason); reason is set when the description cannot be used.
     Implements design/value-generation.md Sec 6.5's full condition grammar:
     a node-level 'attr cmp value' (as before, now also accepting a quoted
-    string literal for string-typed attributes), a component-level
-    'kind[i].attr cmp value' or existential 'kind[*].attr cmp value', and a
-    cardinality 'count(kind) cmp n'. Attribute and kind names are resolved
-    against the current dataset's own declaration (DS), not a fixed
-    suite-wide list, so a custom dataset's 'where'/'order_by' just work.
+    string literal for string-typed attributes), a list condition
+    'name[i].attr cmp value' or existential 'name[*].attr cmp value'
+    (".attr" omitted for a bare-scalar list), and a cardinality condition
+    'count(name) cmp n'. Attribute and list names are resolved against the
+    current dataset's own declaration (DS), not a fixed suite-wide list,
+    so a custom dataset's 'where'/'order_by' just work.
 
     Each entry in spec["conds"] is one of:
       ("node", attr_index, op, value)
-      ("comp", kind, index_or_None, attr, op, value)   # index None = 'kind[*]'
-      ("count", kind, op, n)
+      ("list", name, index_or_None, attr_or_None, op, value)  # index None = 'name[*]'
+      ("count", name, op, n)
     """
     spec = {"conds": [], "order_by": match.get("order_by") or [],
             "limit": int(match["limit"]) if match.get("limit") not in (None, "") else None}
@@ -231,20 +233,26 @@ def parse_match(match):
     if where:
         for raw_term in re.split(r"\s+and\s+", where, flags=re.IGNORECASE):
             term = raw_term.strip()
-            c = COUNT_COND_RE.match(term)
+            c = LENGTH_COND_RE.match(term)
             if c:
-                kind, op, n = c.groups()
-                if DS.component_kind(kind) is None:
-                    return None, f"match condition '{term}' names unknown component kind '{kind}'"
-                spec["conds"].append(("count", kind, OPS[op], int(n)))
+                name, op, n = c.groups()
+                if DS.list_attr(name) is None:
+                    return None, f"match condition '{term}' names unknown list attribute '{name}'"
+                spec["conds"].append(("count", name, OPS[op], int(n)))
                 continue
-            c = COMP_COND_RE.match(term)
+            c = LIST_COND_RE.match(term)
             if c:
-                kind, idx, attr, op, raw_value = c.groups()
-                ck = DS.component_kind(kind)
-                if ck is None or attr not in [a["name"] for a in ck.get("attributes", [])]:
+                name, idx, attr, op, raw_value = c.groups()
+                la = DS.list_attr(name)
+                if la is None:
                     return None, f"match condition '{term}' not understood"
-                spec["conds"].append(("comp", kind, None if idx == "*" else int(idx),
+                is_record = la["entries"].get("type") == "record"
+                if is_record:
+                    if attr is None or attr not in [a["name"] for a in la["entries"].get("tuples", [])]:
+                        return None, f"match condition '{term}' not understood"
+                elif attr is not None:
+                    return None, f"match condition '{term}' not understood"
+                spec["conds"].append(("list", name, None if idx == "*" else int(idx),
                                       attr, OPS[op], parse_cond_value(raw_value)))
                 continue
             c = NODE_COND_RE.match(term)
@@ -259,35 +267,34 @@ def parse_match(match):
     return spec, None
 
 
-def cond_matches(cond, comp, seq, node_record):
-    """One condition's match(...) from Sec 6.5, evaluated at coordinate (comp, seq).
+def cond_matches(cond, cid, seq, node_record):
+    """One condition's match(...) from Sec 6.5, evaluated at coordinate (cid, seq).
 
     *node_record* is this row's flat-attribute tuple in DS.attr_names order
     (what DS.records() yields), used for "node" conditions without a second
-    recomputation. "comp"/"count" conditions call DS.expected_count() /
-    DS.expected_component_attr(), which recompute directly rather than
-    generating every instance of the kind (DS.expected_components()) --
-    the narrow primitives Sec 6.5 calls expected_count() and
-    evaluate(attr, C_i).
+    recomputation. "list"/"count" conditions call DS.expected_length() /
+    DS.expected_list_value(), which recompute directly rather than
+    generating every entry of the list (DS.expected_lists()) -- the narrow
+    primitives Sec 6.5 calls expected_length() and evaluate(attr, C_i).
     """
     tag = cond[0]
     if tag == "node":
         _, i, op, v = cond
         return op(node_record[i], v)
     if tag == "count":
-        _, kind, op, n = cond
-        return op(DS.expected_count(kind, comp, seq), n)
-    # tag == "comp"
-    _, kind, idx, attr, op, v = cond
-    n = DS.expected_count(kind, comp, seq)
+        _, name, op, n = cond
+        return op(DS.expected_length(name, cid, seq), n)
+    # tag == "list"
+    _, name, idx, attr, op, v = cond
+    n = DS.expected_length(name, cid, seq)
     if idx is not None:
-        return idx < n and op(DS.expected_component_attr(kind, idx, attr, comp, seq), v)
-    return any(op(DS.expected_component_attr(kind, i, attr, comp, seq), v) for i in range(n))
+        return idx < n and op(DS.expected_list_value(name, idx, attr, cid, seq), v)
+    return any(op(DS.expected_list_value(name, i, attr, cid, seq), v) for i in range(n))
 
 
-def record_matches(spec, comp, seq, node_record):
+def record_matches(spec, cid, seq, node_record):
     """match(condition, C) for every condition in spec["conds"], ANDed (Sec 6.5)."""
-    return all(cond_matches(cond, comp, seq, node_record) for cond in spec["conds"])
+    return all(cond_matches(cond, cid, seq, node_record) for cond in spec["conds"])
 
 
 def load_query_set(path, adapter):
@@ -333,10 +340,10 @@ def load_query_set(path, adapter):
 
 def verify(spec, columns, rows):
     """Compare a full result with the records the question should return."""
-    idx_comp = DS.attr_names.index("component_id")
+    idx_cid = DS.attr_names.index("component_id")
     idx_seq = DS.attr_names.index("seq")
     expected = [r for r in DS.records()
-               if record_matches(spec, r[idx_comp], r[idx_seq], r)]
+               if record_matches(spec, r[idx_cid], r[idx_seq], r)]
     have_key = "component_id" in columns and "seq" in columns
     problems, notes = [], []
     got = want = None
@@ -344,7 +351,7 @@ def verify(spec, columns, rows):
         vp, keys, warn = validate_rows(rows)
         problems += vp[:3]
         notes += warn
-        want = {(r[idx_comp], r[idx_seq]) for r in expected}
+        want = {(r[idx_cid], r[idx_seq]) for r in expected}
         got = set(keys)
         if len(keys) != len(got):
             problems.append(f"{len(keys) - len(got)} duplicate rows")
@@ -363,7 +370,7 @@ def verify(spec, columns, rows):
         # How a limit is applied differs between backends: to the whole
         # result, or on each server to its own partition. Both are accepted.
         per_server = sum(min(spec["limit"],
-                             sum(1 for r in expected if DS.partition_of(r[idx_comp]) == p))
+                             sum(1 for r in expected if DS.partition_of(r[idx_cid]) == p))
                          for p in range(DS.partitions))
         overall = min(spec["limit"], len(expected))
         if n == overall:
@@ -590,16 +597,16 @@ def load_ingest_results(target):
     import glob
     pattern = os.path.join(RESULTS_DIR, f"write-{target}-*.json")
     files = sorted(glob.glob(pattern))
-    nodes = []
+    hosts = []
     for f in files:
         host = os.path.basename(f).replace(f"write-{target}-", "").replace(".json", "")
         try:
             with open(f) as fh:
                 d = json.load(fh)
         except Exception:
-            nodes.append({"host": host, "error": f"could not read {f}"})
+            hosts.append({"host": host, "error": f"could not read {f}"})
             continue
-        nodes.append({
+        hosts.append({
             "host": host,
             "backend": WRITE_BACKEND,
             "writer": d.get("writer", "-"),
@@ -609,39 +616,39 @@ def load_ingest_results(target):
             "sync_s": d.get("close_sync_s"),
             "records_per_s": d.get("records_per_s"),
         })
-    ok = [n for n in nodes if "error" not in n and isinstance(n.get("records"), (int, float))]
+    ok = [h for h in hosts if "error" not in h and isinstance(h.get("records"), (int, float))]
     summary = {}
     if ok:
         summary = {
-            "total_records": sum(n["records"] for n in ok),
-            "max_write_s": max(n["write_s"] for n in ok if n.get("write_s")),
-            "max_sync_s": max((n["sync_s"] for n in ok if n.get("sync_s")), default=0),
+            "total_records": sum(h["records"] for h in ok),
+            "max_write_s": max(h["write_s"] for h in ok if h.get("write_s")),
+            "max_sync_s": max((h["sync_s"] for h in ok if h.get("sync_s")), default=0),
         }
         elapsed = summary["max_write_s"] + summary["max_sync_s"]
         if elapsed > 0:
             summary["aggregate_records_per_s"] = round(summary["total_records"] / elapsed)
-    return {"nodes": nodes, "summary": summary}
+    return {"hosts": hosts, "summary": summary}
 
 
 def print_ingest_summary(ingest):
     """Print the ingest results as a table."""
-    nodes = ingest.get("nodes", [])
-    if not nodes:
+    hosts = ingest.get("hosts", [])
+    if not hosts:
         print("  (no ingest result files found)")
         return
-    hw = max(len(n.get("host", "")) for n in nodes)
+    hw = max(len(h.get("host", "")) for h in hosts)
     hw = max(hw, len("total/max"))
     print(f"  {'host':{hw}}  {'writer':>6}  {'records':>10}  {'write_s':>8}"
           f"  {'sync_s':>7}  {'records/s':>10}")
-    for n in nodes:
-        host = n.get("host", "?")
-        if "error" in n:
-            print(f"  {host:{hw}}  {n['error']}")
+    for h in hosts:
+        host = h.get("host", "?")
+        if "error" in h:
+            print(f"  {host:{hw}}  {h['error']}")
             continue
         def num(key, spec):
-            v = n.get(key)
+            v = h.get(key)
             return spec.format(v) if isinstance(v, (int, float)) else "-"
-        print(f"  {host:{hw}}  {n.get('writer','-'):>6}  {num('records', '{:>10d}')}"
+        print(f"  {host:{hw}}  {h.get('writer','-'):>6}  {num('records', '{:>10d}')}"
               f"  {num('write_s', '{:>8.2f}')}"
               f"  {num('sync_s', '{:>7.2f}')}"
               f"  {num('records_per_s', '{:>10d}')}")
@@ -780,7 +787,7 @@ def main():
         "servers": SERVERS,
         "ingest": {
             "backend": WRITE_BACKEND,
-            "nodes": getattr(rep, "ingest", {}).get("nodes", []),
+            "hosts": getattr(rep, "ingest", {}).get("hosts", []),
             "summary": getattr(rep, "ingest", {}).get("summary", {}),
         },
         "query": {

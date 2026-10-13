@@ -94,7 +94,7 @@ Every adapter instance receives `self.ctx`, a dict with these keys:
 | --- | --- | --- |
 | `target` | The name of the written data (the container path for SOS, or the measurement name constructed as `{DATA_NAME}_{writer}`) | `monitoring_influx` |
 | `schema` | The dataset name from the JSON definition — the table name used in query strings and the name verification matches against | `monitoring` |
-| `servers` | List of server hostnames from `SERVER_NODES` | `["node-1", "node-2"]` |
+| `servers` | List of server hostnames from `SERVER_HOSTS` | `["node-1", "node-2"]` |
 | `run_dir` | Scratch directory on the current node | `/tmp/monbench-user/run` |
 | `env` | The full environment (`os.environ`), including all settings from `bench.conf` and the backend's own config |  |
 
@@ -110,7 +110,7 @@ Each adapter subclass must implement these methods:
 | `query(text)` | Yes | Run one query and yield its result in batches |
 | `count(batch)` | Yes | Return the number of rows in a batch. Default: `len(batch)` |
 | `records(batch)` | No | Return `(columns, rows)` where rows are dicts keyed by attribute name. Used for verification only |
-| `postprocess(text, columns, rows)` | No | Optional. Backend-specific shaping of a query's full, assembled result (after `records()` and column-map reversal), for verification only. Default: no-op (`return rows`). See `core/adapter.py`'s docstring and `backends/sos/query/sos_query.py` for a concrete use: collapsing a component-kind query's possible multiple rows per node sample into one, since the SOS/DSOS query language has no JOIN/DISTINCT to do it in the query text itself |
+| `postprocess(text, columns, rows)` | No | Optional. Backend-specific shaping of a query's full, assembled result (after `records()` and column-map reversal), for verification only. Default: no-op (`return rows`). See `core/adapter.py`'s docstring and `backends/sos/query/sos_query.py` for a concrete use: collapsing a list-attribute query's possible multiple rows per node sample into one, since the SOS/DSOS query language has no JOIN/DISTINCT to do it in the query text itself |
 | `close()` | No | Release the connection |
 
 The engine times each run from the call to `query()` until the last batch has been counted. Do only what a normal client of the backend would do inside `query()`, so timings stay comparable.
@@ -183,7 +183,7 @@ bin/run.sh -c bench-mydb.conf -l ssh all
 bin/run.sh -c bench-mydb.conf -l ssh stop clean
 ```
 
-Start with a small dataset (`SAMPLES=100 COMPONENTS_PER_NODE=4`) to iterate quickly. Increase once the queries pass verification.
+Start with a small dataset (`SAMPLES=100 COMPONENT_IDS_PER_SERVER=4`) to iterate quickly. Increase once the queries pass verification.
 
 ## Defining a custom dataset
 
@@ -229,15 +229,20 @@ see `dataset/default.json` for the full list):
 | `attributes` | The columns. `name` is how queries and the verifier refer to each one. `type` is used by `type_overrides` to apply per-backend column renaming and literal formatting |
 | `keys` | The access paths the data is meant to be queried by; each backend maps them onto its own indexing (e.g. SOS creates an index for each, InfluxDB maps tags) |
 
-A dataset may also declare `components`: zero or more component kinds, each
-a flat record type with a variable, per-sample instance count, nested one
-level below the node (design/value-generation.md Sec 6) — see
-`dataset/curated_metrics_like.json` for a worked example (`cpu`, `netdev`).
-This is generated and verified generically by `core/dataset.py`/`core/
-valuegen.py` and `core/bench.py` with no code change needed per dataset;
-whether a *backend* can write and natively query a given dataset's component
-kinds is a separate, per-backend question (see "Writing a new backend"
-above and `STATUS.md` for which backends currently do).
+Any entry in `attributes` may instead be a **list attribute**: a per-sample
+nested list, identified by its own name like any other attribute, with
+`"type": "list"`, a per-sample length (`min_list_length`/`max_list_length`,
+or the `list_length` fixed-length shorthand, plus an optional
+`length_stride`), and an `entries` spec that is either
+`{"type": "record", "tuples": [...]}` (a flat record of named scalar
+fields) or a bare scalar type spec (just `{"type": ..., ...}`, with no
+`name` of its own) — see `dataset/curated_metrics_like.json` for a worked
+example (`cpu`, `netdev`, design/value-generation.md Sec 6). This is
+generated and verified generically by `core/dataset.py`/`core/valuegen.py`
+and `core/bench.py` with no code change needed per dataset; whether a
+*backend* can write and natively query a given dataset's list attributes
+is a separate, per-backend question (see "Writing a new backend" above and
+`STATUS.md` for which backends currently do).
 
 Set `DATASET` in `bench.conf` to point to your definition file:
 
@@ -248,20 +253,20 @@ DATASET="${BENCH_DIR}/dataset/my-shape.json"
 ### The value rules: `core/dataset.py` / `core/valuegen.py`
 
 The value rules are a deterministic, hash-based function of each attribute's
-identifying coordinates (dataset name, attribute name, component kind/index,
-node id, job id, sample sequence) — see `design/value-generation.md`. They
-need no per-dataset code: any dataset JSON under `dataset/` is generated and
-verified by the same `core/valuegen.py` (plus its C port, `core/valuegen.c`,
-used by C writers) and `core/dataset.py`/`core/dataset.c`. Every Python
-writer and `core/bench.py` itself call `Dataset.expected()`/
-`Dataset.expected_components()` directly, so they pick up a new dataset
-automatically; `backends/sos/writer/sos_write.c` likewise calls into
-`core/dataset.c`/`core/valuegen.c` rather than reimplementing anything.
+identifying coordinates (dataset name, attribute name, list name/entry
+index, node id, job id, sample sequence) — see `design/value-generation.md`.
+They need no per-dataset code: any dataset JSON under `dataset/` is
+generated and verified by the same `core/valuegen.py` (plus its C port,
+`core/valuegen.c`, used by C writers) and `core/dataset.py`/`core/
+dataset.c`. Every Python writer and `core/bench.py` itself call
+`Dataset.expected()`/`Dataset.expected_lists()` directly, so they pick up a
+new dataset automatically; `backends/sos/writer/sos_write.c` likewise calls
+into `core/dataset.c`/`core/valuegen.c` rather than reimplementing anything.
 
 Per-CPU-core and per-network-interface metrics (which `curated_metrics`
 models as nested LDMS records — a variable-length list of per-core or
-per-interface values per sample) are supported as component kinds (above),
-one level of nesting below the node; a component kind's own attribute
+per-interface values per sample) are supported as list attributes (above),
+one level of nesting below the node; a list attribute's own entries
 containing a further nested list is out of scope — see
 design/value-generation.md Sec 6.6.
 
@@ -310,29 +315,29 @@ backend's query language:
 
 | Key | Purpose |
 | --- | --- |
-| `where` | Conditions joined by `and`, with op one of `==`, `!=`, `<`, `<=`, `>`, `>=`. No `or`, no aggregates. Three condition forms, generic over any attribute or declared component kind the dataset defines (see `design/value-generation.md` Sec 6.5): a flat condition `<attribute> <op> <value>`; a component condition `<kind>[<i>].<attribute> <op> <value>` (a specific instance) or `<kind>[*].<attribute> <op> <value>` (true if any instance of that kind matches); and a cardinality condition `count(<kind>) <op> <n>`. `<value>` is a number, or a quoted string (`'...'` or `"..."`) for a `string`-typed attribute |
+| `where` | Conditions joined by `and`, with op one of `==`, `!=`, `<`, `<=`, `>`, `>=`. No `or`, no aggregates. Three condition forms, generic over any attribute or declared list attribute the dataset defines (see `design/value-generation.md` Sec 6.5): a flat condition `<attribute> <op> <value>`; a list condition `<name>[<i>].<attribute> <op> <value>` (a specific entry instance) or `<name>[*].<attribute> <op> <value>` (true if any entry of that list matches) — `.{attribute}` is omitted for a list whose entries are a bare scalar (the entry's own value is compared directly); and a cardinality condition `count(<name>) <op> <n>`. `<value>` is a number, or a quoted string (`'...'` or `"..."`) for a `string`-typed attribute |
 | `order_by` | List of attribute names the result must be ordered by |
 | `limit` | Maximum number of rows (the verifier accepts both whole-result and per-server semantics) |
 
-Component conditions describe the question in backend-neutral terms for
+List conditions describe the question in backend-neutral terms for
 verification; a backend also needs its own native query against however it
-stores that component kind to actually answer the question (the backend
+stores that list attribute to actually answer the question (the backend
 mapping in `design/value-generation.md` Sec 6.5). **InfluxDB, SOS and DSOS
-all have this now**: a component kind is written to its own measurement
+all have this now**: a list attribute is written to its own measurement
 or schema (`backends/influxdb/README.md`'s and `backends/sos/README.md`'s
-"Component-kind data model mapping" sections), and a native query answers
-`kind[i].attr`/`kind[*].attr` against it — InfluxDB with a SQL join back to
+"List attribute data model mapping" sections), and a native query answers
+`name[i].attr`/`name[*].attr` against it — InfluxDB with a SQL join back to
 the node measurement on `(component_id, timestamp)`; SOS/DSOS (whose query
-language has no JOIN) by selecting straight from the per-kind schema, with
-the existential `kind[*].attr` form's possible multiple-rows-per-sample
-collapsed by the query engine's `Adapter.postprocess()` hook (`core/
-adapter.py`) rather than in the query text — see
-`queries/curated_metrics.json` for worked examples against
+language has no JOIN) by selecting straight from the per-list-attribute
+schema, with the existential `name[*].attr` form's possible
+multiple-rows-per-sample collapsed by the query engine's
+`Adapter.postprocess()` hook (`core/adapter.py`) rather than in the query
+text — see `queries/curated_metrics.json` for worked examples against
 `dataset/curated_metrics_like.json`, each with `"influxdb"` and `"dsos"`
-query strings. `count(kind)` is native only on InfluxDB: SOS's query
+query strings. `count(name)` is native only on InfluxDB: SOS's query
 language has no `GROUP BY`/`HAVING`-style count filter, so that one
 condition form still has no native query string for the `sos`/`dsos`
-adapters and reports SKIP (see `STATUS.md`). Every component-kind
+adapters and reports SKIP (see `STATUS.md`). Every list attribute's entry
 attribute type maps onto a real SOS schema type (`backends/sos/
 make_schema.py`'s `sos_attr()`): `string` becomes a fixed-length
 CHAR_ARRAY and `uint8`/`int8` widen to the closest wider SOS integer
@@ -371,10 +376,11 @@ filled from the dataset so that one file works at any data-set size:
 | `{comp_slast}`, `{comp_last}` | First component on the last server; last component overall |
 | `{job_first}`, `{job_mid}`, `{job_last}` | First job, the job at mid-span, last job |
 
-A component-kind measurement name is not a separate placeholder: write it as
-`{schema}_<kind>` directly in the query string (e.g. `{schema}_cpu`) — the
-`{schema}` placeholder still expands normally, leaving the kind suffix as
-literal text, exactly like `queries/curated_metrics.json`'s queries do.
+A list attribute's measurement name is not a separate placeholder: write it
+as `{schema}_<name>` directly in the query string (e.g. `{schema}_cpu`) —
+the `{schema}` placeholder still expands normally, leaving the list
+attribute's name suffix as literal text, exactly like
+`queries/curated_metrics.json`'s queries do.
 
 Placeholder values for types that have a `"literal"` entry in the adapter's
 `type_overrides` are automatically wrapped with the backend's native syntax
@@ -384,7 +390,7 @@ Column renaming from `type_overrides` is applied to the query template before
 placeholders are expanded, so that literal format strings that contain
 dataset attribute names (e.g. `to_timestamp_seconds`) are not mangled. This
 also means a dataset attribute name that is a plain-text substring of a
-component-kind measurement name (none of the current datasets have one)
+list attribute's measurement name (none of the current datasets have one)
 would be rewritten too — not a concern today, but worth knowing if you name
 attributes and measurements close together.
 

@@ -38,7 +38,7 @@ class Adapter:
         """ctx: dict with
              target   name of the data written (container, database, ...)
              schema   data-set name (the record type)
-             servers  list of server hosts from SERVER_NODES
+             servers  list of server hosts from SERVER_HOSTS
              run_dir  scratch directory on this node
              env      the harness settings (os.environ)
         """
@@ -84,9 +84,9 @@ class Adapter:
         normal client without that language feature would have to do
         itself. See backends/sos/query/sos_query.py's and
         backends/dsos/query/dsos_query.py's postprocess() for a concrete
-        case: collapsing multiple matching component-kind instances of
-        one node sample into the one node-shaped row design/
-        value-generation.md Sec 6.5's kind[*].attr existential condition
+        case: collapsing multiple matching list-attribute entry instances
+        of one node sample into the one node-shaped row design/
+        value-generation.md Sec 6.5's name[*].attr existential condition
         expects, which the SOS/DSOS query language has no DISTINCT/JOIN
         to do natively.
 
