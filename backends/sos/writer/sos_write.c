@@ -36,9 +36,10 @@
  * family and exact type_str -- int8/int16 share set_i16() (both widen to
  * a SOS INT16, same as uint8/uint16 share set_u16() for UINT16), int32
  * uses set_i32(), int64 uses set_i64(). The union member names
- * (prim.int16_/int32_/int64_) are confirmed against a real sos.h (see
- * sos_value_s's sos_primary_u) -- unlike the CHAR_ARRAY path below, which
- * is still a best-effort guess.
+ * (prim.int16_/int32_/int64_) and the CHAR_ARRAY path (set_char_array())
+ * are both confirmed against a real sos.h/sos.c/sos_value.c and the LDMS
+ * store_sos plugin's CHAR_ARRAY handling -- see set_char_array()'s own
+ * comment for the sos_array_new() requirement that was missing before.
  *
  * If the dataset declares list attributes (design/value-generation.md
  * Sec 6), each one's entry instances are also written, one schema per
@@ -116,11 +117,11 @@ static const struct {
 	{ "TIMESTAMP", SOS_TYPE_TIMESTAMP }, { "JOIN", SOS_TYPE_JOIN },
 	/* A string attribute (backends/sos/make_schema.py's sos_attr())
 	 * becomes a fixed-length character array -- the template's "size"
-	 * field (schema_from_template_obj() below) gives its length. Not
-	 * built/tested against a real sos.h in this sandbox; confirm
-	 * SOS_TYPE_CHAR_ARRAY is the right constant (and that
-	 * sos_schema_attr_add()'s size argument means "number of
-	 * characters" for it) before trusting this against a real install. */
+	 * field (schema_from_template_obj() below) gives its length.
+	 * SOS_TYPE_CHAR_ARRAY and sos_schema_attr_add()'s size argument
+	 * ("number of characters") are both confirmed against a real
+	 * sos.h; see set_char_array() for the one thing that actually was
+	 * wrong (array storage allocation, not this type mapping). */
 	{ "CHAR_ARRAY", SOS_TYPE_CHAR_ARRAY },
 };
 
@@ -299,8 +300,7 @@ static inline void set_u64(sos_obj_t obj, sos_attr_t attr, uint64_t v)
  * attribute becomes a SOS INT16 (make_schema.py's sos_attr() -- SOS has
  * no INT8 either), so both share set_i16; int32 uses set_i32; int64 uses
  * set_i64. sos_primary_u's int16_/int32_/int64_ member names are
- * confirmed against a real sos.h (unlike set_char_array() below, which
- * is still unverified). */
+ * confirmed against a real sos.h. */
 static inline void set_i16(sos_obj_t obj, sos_attr_t attr, int16_t v)
 {
 	struct sos_value_s v_;
@@ -345,21 +345,36 @@ static inline void set_ts(sos_obj_t obj, sos_attr_t attr, uint64_t secs)
 /* Write a NUL-terminated string into a fixed-length CHAR_ARRAY attribute
  * (backends/sos/make_schema.py's sos_attr() "size" field gave it exactly
  * *len* characters, matching the attribute's declared "length" -- the
- * same len ds_attr_t.length carries, so the two always agree). Not
- * built/tested against a real sos.h (see the CHAR_ARRAY type_map entry's
- * comment); sos_value_init() on an array-typed attribute is assumed to
- * size *val->data* for the attribute's declared array length, with
- * data->array.data.char_ the character buffer and data->array.count the
- * length to store, mirroring the prim.* pattern the scalar setters above
- * use -- confirm both against the real SOS header before trusting this. */
-static inline void set_char_array(sos_obj_t obj, sos_attr_t attr,
-                                   const char *s, size_t len)
+ * same len ds_attr_t.length carries, so the two always agree).
+ *
+ * CHAR_ARRAY is a SOS *array* type, and an array attribute's storage is
+ * not part of the fixed-size object layout sos_obj_new() allocates --
+ * sos_value_init() on a freshly-allocated object returns NULL for it
+ * (sos_value.c checks ref_val->array_info.offset == 0 and bails), which
+ * is exactly what crashed here: this function used to call
+ * sos_value_init() and dereference the result unconditionally. The
+ * actual API for writing into an array attribute is sos_array_new(),
+ * which allocates (reallocating the object as needed) and returns a
+ * valid sos_value_t pointing at that storage -- see sos.c's
+ * sos_obj_attr_value_set_va() and the LDMS store_sos plugin's
+ * CHAR_ARRAY handling, both of which call sos_array_new() before
+ * writing, never sos_value_init(). sos_array_new() sets
+ * val->data->array.count itself (mirrors sos_value_data_new()'s array
+ * path in sos_value.c), so this function only needs to copy the bytes
+ * into val->data->array.data.char_ once allocation succeeds. */
+static inline int set_char_array(sos_obj_t obj, sos_attr_t attr,
+                                  const char *s, size_t len)
 {
 	struct sos_value_s v_;
-	sos_value_t val = sos_value_init(&v_, obj, attr);
-	val->data->array.count = (uint32_t)len;
+	sos_value_t val = sos_array_new(&v_, attr, obj, len);
+	if (!val) {
+		fprintf(stderr, "error %d allocating char array (len %zu)\n",
+			errno, len);
+		return -1;
+	}
 	memcpy(val->data->array.data.char_, s, len);
 	sos_value_put(val);
+	return 0;
 }
 
 static sos_attr_t must_attr(sos_schema_t schema, const char *name)
@@ -395,8 +410,12 @@ struct value_attr {
  * the flat resolution loop in main() and build_list_writer(), which are
  * what decide which families get a value_attr at all; DS_FAMILY_TIMESTAMP
  * never does, since the identity timestamp attribute is written directly
- * via set_ts(), not through this dispatcher). */
-static void set_value(sos_obj_t obj, const ds_attr_t *da, sos_attr_t sa,
+ * via set_ts(), not through this dispatcher).
+ *
+ * Returns 0 on success, -1 if the underlying SOS write failed (currently
+ * only possible for DS_FAMILY_STRING, if sos_array_new() fails -- see
+ * set_char_array()); callers count that like any other write error. */
+static int set_value(sos_obj_t obj, const ds_attr_t *da, sos_attr_t sa,
                        const ds_value_t *v)
 {
 	switch (da->family) {
@@ -407,7 +426,7 @@ static void set_value(sos_obj_t obj, const ds_attr_t *da, sos_attr_t sa,
 			set_u64(obj, sa, v->u64);
 		else	/* uint8 or uint16: both map to a SOS UINT16 */
 			set_u16(obj, sa, (uint16_t)v->u64);
-		break;
+		return 0;
 	case DS_FAMILY_INT:
 		if (strcasecmp(da->type_str, "int32") == 0)
 			set_i32(obj, sa, (int32_t)v->i64);
@@ -415,17 +434,17 @@ static void set_value(sos_obj_t obj, const ds_attr_t *da, sos_attr_t sa,
 			set_i64(obj, sa, v->i64);
 		else	/* int8 or int16: both map to a SOS INT16 */
 			set_i16(obj, sa, (int16_t)v->i64);
-		break;
+		return 0;
 	case DS_FAMILY_DOUBLE:
 		set_double(obj, sa, v->d);
-		break;
+		return 0;
 	case DS_FAMILY_STRING:
-		set_char_array(obj, sa, v->str, da->length);
-		break;
+		return set_char_array(obj, sa, v->str, da->length);
 	case DS_FAMILY_TIMESTAMP:
+	default:
 		/* Unreachable: never resolved into a value_attr (see this
 		 * function's doc comment). */
-		break;
+		return 0;
 	}
 }
 
@@ -490,11 +509,15 @@ static int build_list_writer(sos_t sos, json_t *list_tmpl, const ds_list_t *list
 
 /* Write one entry instance (a ds_expected_lists() record) into its list
  * attribute's schema -- the per-list analog of the flat write loop's
- * body below. Returns sos_obj_index()'s rc (0 on success). */
+ * body below. Returns non-zero on failure: either sos_obj_index()'s rc,
+ * or -1 if any of this entry's values failed to write (see set_value()),
+ * checked before indexing so a failed value write is never silently
+ * indexed as if it had succeeded. */
 static int write_list_entry(struct list_writer *lw, uint64_t comp, uint64_t job_id,
                              uint64_t seq, uint64_t ts, const ds_list_rec_t *rec)
 {
 	size_t vi;
+	int value_err = 0;
 	sos_obj_t obj = sos_obj_new(lw->schema);
 	if (!obj) {
 		fprintf(stderr, "error %d allocating list object\n", errno);
@@ -508,14 +531,16 @@ static int write_list_entry(struct list_writer *lw, uint64_t comp, uint64_t job_
 	if (lw->is_record) {
 		for (vi = 0; vi < lw->n_value_attrs; vi++) {
 			const struct value_attr *va = &lw->value_attrs[vi];
-			set_value(obj, va->attr, va->sos_attr, &rec->values[va->idx]);
+			if (set_value(obj, va->attr, va->sos_attr, &rec->values[va->idx]))
+				value_err = -1;
 		}
 	} else {
-		set_value(obj, lw->scalar_entry, lw->a_value, &rec->values[0]);
+		if (set_value(obj, lw->scalar_entry, lw->a_value, &rec->values[0]))
+			value_err = -1;
 	}
 	int rc = sos_obj_index(obj);
 	sos_obj_put(obj);
-	return rc;
+	return value_err ? value_err : rc;
 }
 
 int main(int argc, char **argv)
@@ -674,6 +699,7 @@ int main(int argc, char **argv)
 			uint64_t comp = base + c;
 			ds_value_t values[DS_MAX_ATTRS];
 			size_t vi;
+			int value_err = 0;
 
 			ds_expected(&ds, comp, seq, values);
 
@@ -688,15 +714,17 @@ int main(int argc, char **argv)
 			set_u64(obj, a_seq, values[idx_seq].u64);
 			for (vi = 0; vi < n_value_attrs; vi++) {
 				const struct value_attr *va = &value_attrs[vi];
-				set_value(obj, va->attr, va->sos_attr, &values[va->idx]);
+				if (set_value(obj, va->attr, va->sos_attr, &values[va->idx]))
+					value_err = 1;
 			}
 			rc = sos_obj_index(obj);
 			sos_obj_put(obj);
-			if (rc) {
+			if (rc || value_err) {
 				errors++;
 				if (errors <= 10)
-					fprintf(stderr, "error %d indexing record %" PRIu64 "\n",
-						rc, written);
+					fprintf(stderr, "error %d indexing record %" PRIu64 "%s\n",
+						rc, written,
+						value_err ? " (value write failed)" : "");
 			}
 			written++;
 
