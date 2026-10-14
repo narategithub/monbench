@@ -43,10 +43,24 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 		"${dataset_args[@]}" --storage "${SOS_STORAGE}")
 	log "writing ${target} (${writer} writer, SOS ${SOS_STORAGE}) to ${path}"
 	case "$writer" in
+#	c)
+#		[[ -x "${SOS_DIR}/writer/sos_write" ]] ||
+#			die "C writer not built; run: bin/run.sh build"
+#		"${SOS_DIR}/writer/sos_write" "${args[@]}"
+#		;;
 	c)
 		[[ -x "${SOS_DIR}/writer/sos_write" ]] ||
 			die "C writer not built; run: bin/run.sh build"
-		"${SOS_DIR}/writer/sos_write" "${args[@]}"
+		if [[ -n "${GDB:-}" ]]; then
+			command -v gdbserver >/dev/null 2>&1 ||
+				die "GDB=1 requested but gdbserver is not on PATH"
+			local port="${GDBSERVER_PORT:-$((2345 + index))}"
+			log "GDB=1: launching sos_write under gdbserver on ${HOST}:${port} -- attach with:" \
+				"gdb -ex 'target remote ${HOST}:${port}' ${SOS_DIR}/writer/sos_write"
+			gdbserver ":${port}" "${SOS_DIR}/writer/sos_write" "${args[@]}"
+		else
+			"${SOS_DIR}/writer/sos_write" "${args[@]}"
+		fi
 		;;
 	py)
 		"${PYTHON}" "${SOS_DIR}/writer/sos_write.py" "${args[@]}"
