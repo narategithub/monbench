@@ -195,10 +195,8 @@ class PythonWriter:
 
 def main():
     a = parse_args()
-    # The authoritative attribute list and types come from the dataset
-    # definition (DATASET env var), same as every other writer -- not a
-    # hardcoded name list, so a different or expanded dataset needs no
-    # change here.
+    # Attribute list and types come from the dataset definition, same as
+    # every other writer -- see core/dataset.py's module docstring.
     ds = Dataset(Dataset.load_definition(os.environ["DATASET"]),
                 partitions=1, component_ids=a.components, samples=a.samples,
                 t0=a.t0, interval=a.interval, job_len=a.job_len)

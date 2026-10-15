@@ -39,6 +39,14 @@ empty selects both):
 The C writer is built by `bin/run.sh build`; the Python writer needs the
 `sosdb` module importable on the server nodes.
 
+Both writers (and `dsos_write.py`, which shares `sos_write.py`'s approach)
+treat the SOS schema template -- the JSON built by `make_schema.py` from
+the dataset definition -- as a derived artifact, not their source of
+truth. At write time, the attribute list and each attribute's type come
+from the dataset definition itself (the `DATASET` env var); the template
+only needs a same-named, same-typed SOS attribute for each one. This is
+what lets a new or changed dataset need no change to either writer.
+
 ## Query methods
 
 | `QUERY_ADAPTER` | Adapter | How it queries | Use |

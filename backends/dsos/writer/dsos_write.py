@@ -126,11 +126,8 @@ def main():
     with open(a.template) as f:
         template = json.load(f)
 
-    # The authoritative attribute list and types come from the dataset
-    # definition (DATASET env var -- the same file bench.py and
-    # core/dataset.py meta use), not from the SOS schema template: the
-    # template only needs to have a same-named, same-typed attribute for
-    # each one. This is what lets a new dataset need no change here.
+    # Attribute list and types come from the dataset definition, not the
+    # SOS schema template -- see backends/sos/README.md's "Write methods".
     ds = Dataset(Dataset.load_definition(os.environ["DATASET"]),
                 partitions=1, component_ids=a.components, samples=a.samples,
                 t0=a.t0, interval=a.interval, job_len=a.job_len)

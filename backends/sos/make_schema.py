@@ -20,15 +20,13 @@ If the dataset declares list attributes (design/value-generation.md Sec
 "<dataset_name>_<name>" (the same naming convention
 backends/influxdb/writer/influx_write.py uses for its per-list-attribute
 measurements) -- see convert_list() and backends/sos/README.md's "List
-attribute data model mapping". OUT is now a single JSON document shaping
+attribute data model mapping". OUT is a single JSON document shaping
 both:
 
     {"node": <node schema template>, "lists": {<name>: <template>, ...}}
 
 rather than a bare node template, since there is no backward-compatibility
 constraint on this pre-release suite (see design/value-generation.md Sec 3).
-Every reader of this file (sos_write.py, sos_write.c, dsos_write.py) was
-updated in step.
 """
 import json
 import sys

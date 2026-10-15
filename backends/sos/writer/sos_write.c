@@ -11,44 +11,14 @@
  *   job_id       = 1 + seq / job_len
  *
  * Every other attribute's value comes from the dataset named by the
- * DATASET env var (see core/dataset.h), loaded and resolved once by
- * core/dataset.c and evaluated per record by core/valuegen.c -- this
- * file has no attribute-specific formula of its own and no JSON-parsing
- * of the dataset declaration. That parsing and default-resolution logic
- * lives once, in core/dataset.c, precisely so that this writer (and any
- * other non-Python writer) does not reimplement it; core/dataset.py is
- * the equivalent shared layer the Python writers call, and
- * design/value-generation.md is the design both sides follow.
- *
- * This is the data set defined by the DATASET env var's JSON file,
- * which the query engine verifies against; sos_write.py (and every
- * other writer) produces the same records by calling the same shared
- * layer, in their language's form of it.
- *
- * Scope note: this writer now supports every dataset attribute family --
- * uintN (any width), intN (any width, including int8), double and
- * timestamp are written directly, and string is written as a
- * fixed-length SOS CHAR_ARRAY (see backends/sos/make_schema.py's
- * sos_attr(), which maps every dataset-JSON type onto a real SOS schema
- * type: uint8/int8 widen to the closest wider SOS integer type SOS has,
- * UINT16/INT16, and string becomes CHAR_ARRAY). set_value() below
- * dispatches a value to the right SOS setter by the attribute's resolved
- * family and exact type_str -- int8/int16 share set_i16() (both widen to
- * a SOS INT16, same as uint8/uint16 share set_u16() for UINT16), int32
- * uses set_i32(), int64 uses set_i64(). The union member names
- * (prim.int16_/int32_/int64_) and the CHAR_ARRAY path (set_char_array())
- * are both confirmed against a real sos.h/sos.c/sos_value.c and the LDMS
- * store_sos plugin's CHAR_ARRAY handling -- see set_char_array()'s own
- * comment for the sos_array_new() requirement that was missing before.
+ * DATASET env var, loaded and evaluated through core/dataset.h -- see
+ * that header's own comment for why this writer has no JSON-parsing or
+ * attribute-formula code of its own.
  *
  * If the dataset declares list attributes (design/value-generation.md
  * Sec 6), each one's entry instances are also written, one schema per
  * list attribute -- see struct list_writer below and
- * backends/sos/README.md's "List attribute data model mapping". The
- * scope above applies per list attribute too: build_list_writer() now
- * writes a list's signed-integer tuple fields (or bare-scalar entry) the
- * same way the flat loop does, through the same set_value() dispatcher,
- * so no list attribute's entry is skipped any more.
+ * backends/sos/README.md's "List attribute data model mapping".
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -117,11 +87,7 @@ static const struct {
 	{ "TIMESTAMP", SOS_TYPE_TIMESTAMP }, { "JOIN", SOS_TYPE_JOIN },
 	/* A string attribute (backends/sos/make_schema.py's sos_attr())
 	 * becomes a fixed-length character array -- the template's "size"
-	 * field (schema_from_template_obj() below) gives its length.
-	 * SOS_TYPE_CHAR_ARRAY and sos_schema_attr_add()'s size argument
-	 * ("number of characters") are both confirmed against a real
-	 * sos.h; see set_char_array() for the one thing that actually was
-	 * wrong (array storage allocation, not this type mapping). */
+	 * field (schema_from_template_obj() below) gives its length. */
 	{ "CHAR_ARRAY", SOS_TYPE_CHAR_ARRAY },
 };
 
@@ -140,10 +106,7 @@ static int lookup_type(const char *name, sos_type_t *type)
 /*
  * Build a schema from one already-parsed template object (the same shape
  * the Python Schema.from_template() method accepts: {"name", "uuid",
- * "attrs"}), so that both writers produce an identical schema. This part
- * is unrelated to value generation (it only maps the template's own
- * declared attribute types onto SOS's), so it is unchanged by the move
- * to core/dataset.c below.
+ * "attrs"}), so that both writers produce an identical schema.
  *
  * Takes an already-parsed json_t* rather than loading its own file,
  * because the template file now holds more than one such object --
@@ -230,8 +193,7 @@ err:
 	schema = NULL;
 out:
 	/* tmpl is owned by the caller (it is a slice of main()'s single
-	 * parsed template tree) -- unlike the old schema_from_template(path)
-	 * this replaces, this function does not decref it. */
+	 * parsed template tree); this function does not decref it. */
 	return schema;
 }
 
@@ -299,8 +261,7 @@ static inline void set_u64(sos_obj_t obj, sos_attr_t attr, uint64_t v)
  * set_u64 above, same width-matching rationale: a dataset int8/int16
  * attribute becomes a SOS INT16 (make_schema.py's sos_attr() -- SOS has
  * no INT8 either), so both share set_i16; int32 uses set_i32; int64 uses
- * set_i64. sos_primary_u's int16_/int32_/int64_ member names are
- * confirmed against a real sos.h. */
+ * set_i64. */
 static inline void set_i16(sos_obj_t obj, sos_attr_t attr, int16_t v)
 {
 	struct sos_value_s v_;
@@ -350,10 +311,8 @@ static inline void set_ts(sos_obj_t obj, sos_attr_t attr, uint64_t secs)
  * CHAR_ARRAY is a SOS *array* type, and an array attribute's storage is
  * not part of the fixed-size object layout sos_obj_new() allocates --
  * sos_value_init() on a freshly-allocated object returns NULL for it
- * (sos_value.c checks ref_val->array_info.offset == 0 and bails), which
- * is exactly what crashed here: this function used to call
- * sos_value_init() and dereference the result unconditionally. The
- * actual API for writing into an array attribute is sos_array_new(),
+ * (sos_value.c checks ref_val->array_info.offset == 0 and bails). The
+ * correct API for writing into an array attribute is sos_array_new(),
  * which allocates (reallocating the object as needed) and returns a
  * valid sos_value_t pointing at that storage -- see sos.c's
  * sos_obj_attr_value_set_va() and the LDMS store_sos plugin's
@@ -390,10 +349,9 @@ static sos_attr_t must_attr(sos_schema_t schema, const char *name)
 /* One non-identity dataset attribute, resolved to both its SOS attr
  * handle and the index ds_expected() will fill its value at -- built
  * once from the loaded dataset_t, used by every record. *attr* is kept
- * (rather than just its family, as before) so set_value() can dispatch
- * on its exact type_str too -- needed to tell a SOS-UINT16-via-uint8
- * attribute from a SOS-UINT16-via-uint16 one, a SOS-INT16-via-int8 from
- * a SOS-INT16-via-int16, etc. */
+ * so set_value() can dispatch on its exact type_str too -- needed to
+ * tell a SOS-UINT16-via-uint8 attribute from a SOS-UINT16-via-uint16
+ * one, a SOS-INT16-via-int8 from a SOS-INT16-via-int16, etc. */
 struct value_attr {
 	sos_attr_t sos_attr;
 	size_t idx;		/* index into dataset_t.attrs[] / ds_expected()'s values[],

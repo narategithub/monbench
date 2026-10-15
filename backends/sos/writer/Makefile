@@ -2,11 +2,6 @@
 #   make SOS_PREFIX=/opt/ovis
 # If the libraries are in lib64 or have other names, override SOS_LIBDIR or
 # SOS_LIBS, e.g.  make SOS_LIBDIR=/opt/ovis/lib64
-#
-# sos_write.c no longer parses the dataset JSON or resolves attribute
-# defaults itself -- that logic lives once in core/dataset.c (+
-# core/valuegen.c), which this links against. See sos_write.c's header
-# comment and design/value-generation.md.
 SOS_PREFIX ?= /opt/ovis
 SOS_INCDIR ?= $(SOS_PREFIX)/include
 SOS_LIBDIR ?= $(SOS_PREFIX)/lib
