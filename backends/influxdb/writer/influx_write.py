@@ -39,9 +39,11 @@ from dataset import Dataset              # noqa: E402
 
 # Attributes that become InfluxDB tags rather than fields.
 _TAGS = ("component_id", "job_id")
-# Integer-typed dataset types; formatted with the 'i' line-protocol suffix.
-_INT_TYPES = ("uint8", "uint16", "uint32", "uint64",
-             "int8", "int16", "int32", "int64")
+# Integer-typed dataset types that get an integer line-protocol suffix.
+# Signed types use 'i'; unsigned types use 'u'.
+_SIGNED_INT_TYPES = ("int8", "int16", "int32", "int64")
+_UNSIGNED_INT_TYPES = ("uint8", "uint16", "uint32", "uint64")
+_INT_TYPES = _SIGNED_INT_TYPES + _UNSIGNED_INT_TYPES
 
 
 def parse_args():
@@ -80,11 +82,15 @@ def _escape_string_field(v):
 
 def _field(name, v, attr_type):
     """One name=value line-protocol field, encoded per its declared type:
-    integer types get the 'i' suffix, string types are quoted, everything
-    else (double) is a bare float. Shared by line() (flat attributes) and
-    list_lines() (list-attribute entries) so the two encode identically."""
-    if attr_type in _INT_TYPES:
+    signed integer types get the 'i' suffix, unsigned integer types get
+    the 'u' suffix, string types are quoted, everything else
+    (double) is a bare float. Shared by line() (flat attributes) and
+    list_lines() (list-attribute entries) so the two encode identically.
+    """
+    if attr_type in _SIGNED_INT_TYPES:
         return f"{name}={int(v)}i"
+    if attr_type in _UNSIGNED_INT_TYPES:
+        return f"{name}={int(v)}u"
     if attr_type == "string":
         return f"{name}={_escape_string_field(v)}"
     return f"{name}={v}"                                # double
