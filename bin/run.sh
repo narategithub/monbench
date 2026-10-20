@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# run.sh -- drive the benchmark from one place, for the backend named by
-# BACKEND in bench.conf (a plugin under backends/).
+# run.sh -- drive the benchmark from one place, for the write/query backend
+# pair(s) named in bench.conf (plugins under backends/).
 #
 # usage: bin/run.sh [-c CONF] [-l ssh|slurm|manual] PHASE [PHASE...]
 #
 # Phases (run in the order given):
 #   deploy       copy this directory to every node (ssh only; skipped where the
-#                directory is already shared)
+#                directory is already shared) -- runs once, before any pair
 #   build        build the backend's writers on each server node
 #   serve-write  start the write backend's service on the servers, if it has one
 #   write        write the data set on the servers, once per writer in WRITERS,
@@ -27,6 +27,31 @@
 #   ssh      run each step over ssh (default)
 #   slurm    run each step with srun inside an allocation (see slurm/)
 #   manual   print each step for you to run on the named node, then wait
+#
+# Backend pairs:
+#   bench.conf names either one pair (WRITE_BACKEND/QUERY_BACKEND) or several,
+#   via BACKENDS -- a space-separated list of "writer" or "writer:query"
+#   tokens (query defaults to writer), e.g.:
+#     BACKENDS="sos:dsos influxdb"
+#   All pairs share this file's SERVER_HOSTS, QUERY_HOST, DATASET, QUERY_FILE,
+#   and every other setting; only WRITE_BACKEND/QUERY_BACKEND change per
+#   pair. Every phase given on the command line runs for each pair in turn,
+#   in the order listed, before moving to the next pair (deploy excepted --
+#   it runs once, since it does not depend on the backend).
+#
+#   RUN_DIR and RESULTS_DIR (and so each backend's on-disk data -- see e.g.
+#   SOS_DATA_ROOT, INFLUX_DATA_DIR) are both namespaced per pair, named after
+#   it (e.g. "sos-dsos", "influxdb"). That name is fixed once per pair (see
+#   run_pair below) and reused by every phase in it -- build, write, check,
+#   query, ... -- regardless of which single backend (the write backend, or
+#   the query backend) is actually doing the work for a given phase. That is
+#   what keeps a pair's write and query sides agreeing on where the data is:
+#   e.g. for "sos:dsos", the write phase (handled by sos) and the check/query
+#   phases (handled by dsos, reading the very same on-disk containers sos
+#   wrote) both resolve RUN_DIR from the one fixed "sos-dsos" pair name,
+#   rather than from whichever single backend happens to be running that
+#   particular phase -- keying it that way (e.g. "sos" while writing, "dsos"
+#   while querying) is what caused them to disagree before.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,11 +62,11 @@ while getopts "c:l:h" opt; do
 	case "$opt" in
 	c) CONF="$(cd "$(dirname "$OPTARG")" && pwd)/$(basename "$OPTARG")" ;;
 	l) LAUNCHER="$OPTARG" ;;
-	*) sed -n '2,26p' "$0"; exit 2 ;;
+	*) sed -n '2,54p' "$0"; exit 2 ;;
 	esac
 done
 shift $((OPTIND - 1))
-[[ $# -gt 0 ]] || { sed -n '2,26p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,54p' "$0"; exit 2; }
 case "$LAUNCHER" in ssh | slurm | manual) ;; *) echo "unknown launcher '$LAUNCHER'" >&2; exit 2 ;; esac
 
 # In the Slurm launcher, empty host settings are filled from the allocation.
@@ -58,68 +83,45 @@ fi
 # shellcheck source=../bench.conf
 source "$CONF"
 
+# ------------------------------------------------------------ backend pairs
+# BACKENDS, if set, lists every write/query pair to run this invocation, as
+# space-separated "writer" or "writer:query" tokens (query defaults to
+# writer). Otherwise there is exactly one pair, from WRITE_BACKEND/
+# QUERY_BACKEND, so a single-pair bench.conf works unchanged.
+PAIRS=()
+if [[ -n "${BACKENDS:-}" ]]; then
+	read -r -a _tokens <<<"${BACKENDS}"
+	for _tok in "${_tokens[@]}"; do
+		_w="${_tok%%:*}"
+		if [[ "$_tok" == *:* ]]; then _q="${_tok#*:}"; else _q="$_w"; fi
+		PAIRS+=("${_w}:${_q}")
+	done
+else
+	PAIRS=("${WRITE_BACKEND:-}:${QUERY_BACKEND:-}")
+fi
+[[ ${#PAIRS[@]} -gt 0 ]] || { echo "BACKENDS is set but names no pairs (see bench.conf.example)" >&2; exit 1; }
+for _chk in "${PAIRS[@]}"; do
+	[[ -n "${_chk%%:*}" && -n "${_chk#*:}" ]] ||
+		{ echo "no backend configured: set BACKENDS, or WRITE_BACKEND/QUERY_BACKEND, in bench.conf (see bench.conf.example)" >&2; exit 1; }
+done
+
+# RUN_DIR and RESULTS_DIR are both namespaced per pair below (see run_pair).
+BASE_RUN_DIR="${RUN_DIR}"
+BASE_RESULTS_DIR="${RESULTS_DIR}"
+
+[[ -n "${SERVER_HOSTS:-}" ]] || { echo "SERVER_HOSTS must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
+[[ -n "${QUERY_HOST:-}" ]] || { echo "QUERY_HOST must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
+read -r -a SERVERS <<<"${SERVER_HOSTS}"
+[[ ${#SERVERS[@]} -ge 1 ]] || { echo "SERVER_HOSTS must list at least one host" >&2; exit 1; }
+
 check_plugin() { # NAME
 	[[ -f "${BENCH_DIR}/backends/$1/${1}_backend.conf" && -f "${BENCH_DIR}/backends/$1/${1}_plugin.sh" ]] ||
 		{ echo "unknown backend '$1': no plugin in ${BENCH_DIR}/backends/$1" >&2; exit 1; }
 }
-check_plugin "${WRITE_BACKEND}"
-check_plugin "${QUERY_BACKEND}"
-
-# The write backend supplies the writers and their default settings.
-# shellcheck source=../backends/sos/sos_backend.conf
-source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
-WRITERS="${WRITERS:-${DEFAULT_WRITERS:-}}"
-LIVE_WRITER="${LIVE_WRITER:-${WRITERS%% *}}"
-# Does the write backend require a service on the servers?
-W_SERVICE=0
-{
-	PLUGIN_SERVICE=0
-	source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
-	W_SERVICE="${PLUGIN_SERVICE:-0}"
-} 2>/dev/null
-
-# Does the query backend require a service, and what data can it read?
-Q_SERVICE=0
-Q_READS=""
-{
-	PLUGIN_SERVICE=0 PLUGIN_READS=""
-	source "${BENCH_DIR}/backends/${QUERY_BACKEND}/${QUERY_BACKEND}_backend.conf"
-	Q_SERVICE="${PLUGIN_SERVICE:-0}"
-	Q_READS="${PLUGIN_READS:-}"
-} 2>/dev/null
-
-# Re-source the write backend so its settings (not the query backend's) are
-# the ones forwarded to the write nodes.
-source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
-
-# The query backend must be able to read what the write backend produced.
-if [[ -n "${Q_READS}" && " ${Q_READS} " != *" ${WRITE_BACKEND} "* ]]; then
-	echo "backend '${QUERY_BACKEND}' cannot query data written by '${WRITE_BACKEND}' (it reads: ${Q_READS})" >&2
-	exit 1
-fi
-
-read -r -a SERVERS <<<"${SERVER_HOSTS}"
-[[ ${#SERVERS[@]} -ge 1 ]] || { echo "SERVER_HOSTS must list at least one host" >&2; exit 1; }
-[[ -n "${WRITERS}" ]] || { echo "no WRITERS set and backend ${WRITE_BACKEND} has no DEFAULT_WRITERS" >&2; exit 1; }
-
-# Settings forwarded to every remote step so that environment overrides given
-# to run.sh apply on all nodes, not only here.
-CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_HOSTS QUERY_HOST BENCH_DIR RUN_DIR RESULTS_DIR
-	ENV_SETUP PYTHON DATASET WRITERS DATA_NAME COMPONENT_IDS_PER_SERVER SAMPLES T0
-	INTERVAL JOB_LEN BATCH QUERY_ADAPTER QUERY_FILE REPEAT LIMIT_N
-	LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL)
-# Forward each plugin's own settings too, from both backends.
-for _bc in "${WRITE_BACKEND}" "${QUERY_BACKEND}"; do
-	_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/${_bc}_backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"
-	for _v in ${_pv}; do
-		[[ " ${CONFIG_VARS[*]} " == *" ${_v} "* ]] || CONFIG_VARS+=("${_v}")
-	done
-done
 
 STATE_DIR="${TMPDIR:-/tmp}/monbench-driver-${USER:-$(id -un)}"
-LOG_DIR="${RESULTS_DIR}/logs"
-mkdir -p "$STATE_DIR" "$LOG_DIR"
-FAILED=0
+mkdir -p "$STATE_DIR"
+OVERALL_FAILED=0
 
 say() { printf '\n== %s\n' "$*"; }
 
@@ -185,6 +187,8 @@ on_servers() { # LOGPREFIX ACTION ARGS...
 }
 
 # ----------------------------------------------------------------- phases
+# Backend-independent except for reading the current WRITE_BACKEND/
+# QUERY_BACKEND/PAIR_NAME globals, which run_pair sets before calling these.
 
 phase_deploy() {
 	[[ "$LAUNCHER" == "ssh" ]] || { echo "   deploy is only needed with the ssh launcher"; return 0; }
@@ -246,11 +250,12 @@ _phase_serve_backend() { # BACKEND_NAME SERVICE_FLAG LOG_PREFIX
 		;;
 	slurm)
 		# A background srun step keeps the service alive; its pid is kept here
-		# so that 'stop' can end the step.
+		# so that 'stop' can end the step. Namespaced by pair so two pairs
+		# using the same host/prefix in one invocation don't clash.
 		for host in "${SERVERS[@]}"; do
 			srun ${SRUN_OPTS} -N1 -n1 -w "$host" bash -c "$(BE="${backend}" node_cmd serve-run "$host")" \
 				>"${LOG_DIR}/${prefix}-${host}.log" 2>&1 &
-			echo $! >"${STATE_DIR}/srun-${prefix}-${host}.pid"
+			echo $! >"${STATE_DIR}/srun-${PAIR_NAME}-${prefix}-${host}.pid"
 		done
 		for host in "${SERVERS[@]}"; do
 			for i in $(seq 1 30); do
@@ -269,7 +274,7 @@ _phase_stop_backend() { # BACKEND_NAME SERVICE_FLAG LOG_PREFIX
 	local host pidfile
 	[[ "${service}" == "1" ]] || return 0
 	for host in "${SERVERS[@]}"; do
-		pidfile="${STATE_DIR}/srun-${prefix}-${host}.pid"
+		pidfile="${STATE_DIR}/srun-${PAIR_NAME}-${prefix}-${host}.pid"
 		if [[ "$LAUNCHER" == "slurm" && -f "$pidfile" ]]; then
 			kill "$(cat "$pidfile")" 2>/dev/null || true
 			rm -f "$pidfile"
@@ -284,7 +289,7 @@ phase_write_serve() {
 }
 
 phase_query_serve() {
-	# When write and query backends are the same, their service was already
+	# When write and query backend are the same, their service was already
 	# started by serve-write; running serve-start again would be a no-op at
 	# best, so skip it.
 	if [[ "${WRITE_BACKEND}" == "${QUERY_BACKEND}" ]]; then
@@ -349,8 +354,10 @@ phase_clean() {
 	done
 }
 
-echo "monbench: write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHER} servers=${SERVERS[*]} query-host=${QUERY_HOST}"
-echo "          ${COMPONENT_IDS_PER_SERVER} component IDs x ${SAMPLES} samples per server, writers: ${WRITERS}"
+# ------------------------------------------------------------- phase list
+# Expanded once; shared by every pair. 'deploy' is pulled out and run once,
+# up front, since it copies the whole directory and does not depend on which
+# backend pair is running.
 PHASES=()
 for phase in "$@"; do
 	case "$phase" in
@@ -359,23 +366,121 @@ for phase in "$@"; do
 	*)           PHASES+=("$phase") ;;
 	esac
 done
+
+RUN_PHASES=()
+DID_DEPLOY=0
 for phase in "${PHASES[@]}"; do
-	say "phase: ${phase}"
-	case "$phase" in
-	deploy) phase_deploy ;;
-	build) phase_build || FAILED=1 ;;
-	serve-write) phase_write_serve ;;
-	write) phase_write ;;
-	serve-query) phase_query_serve ;;
-	check) phase_check ;;
-	query) phase_query ;;
-	live) phase_live ;;
-	stop) phase_stop ;;
-	clean) phase_clean ;;
-	*) echo "unknown phase '$phase'" >&2; exit 2 ;;
-	esac
+	if [[ "$phase" == "deploy" ]]; then
+		if [[ $DID_DEPLOY -eq 0 ]]; then
+			say "phase: deploy"
+			phase_deploy
+			DID_DEPLOY=1
+		fi
+	else
+		RUN_PHASES+=("$phase")
+	fi
 done
 
-say "done: $([[ $FAILED -eq 0 ]] && echo 'all steps succeeded' || echo 'one or more steps FAILED')"
-echo "   logs and results: ${RESULTS_DIR}"
-exit $FAILED
+# ------------------------------------------------------- per-pair driver
+run_pair() { # WRITE_BACKEND QUERY_BACKEND
+	WRITE_BACKEND="$1" QUERY_BACKEND="$2"
+	PAIR_NAME="${WRITE_BACKEND}"
+	[[ "${WRITE_BACKEND}" != "${QUERY_BACKEND}" ]] && PAIR_NAME="${WRITE_BACKEND}-${QUERY_BACKEND}"
+	# RUN_DIR and RESULTS_DIR: namespaced per pair, fixed once here for the
+	# whole pair's run and reused by every phase below (build, write, check,
+	# query, ...) regardless of which single backend -- write or query -- is
+	# actually doing the work for a given phase. That is what keeps e.g. a
+	# sos:dsos pair's write phase (handled by sos) and check/query phases
+	# (handled by dsos, reading the same on-disk containers sos wrote)
+	# agreeing on where the data is: both read the one fixed PAIR_NAME-
+	# derived RUN_DIR, rather than a path keyed by whichever single backend
+	# happens to be running that particular phase.
+	RUN_DIR="${BASE_RUN_DIR}/${PAIR_NAME}"
+	RESULTS_DIR="${BASE_RESULTS_DIR}/${PAIR_NAME}"
+	LOG_DIR="${RESULTS_DIR}/logs"
+	mkdir -p "$LOG_DIR"
+	FAILED=0
+
+	check_plugin "${WRITE_BACKEND}"
+	check_plugin "${QUERY_BACKEND}"
+
+	# The write backend supplies the writers and their default settings.
+	# shellcheck source=../backends/sos/sos_backend.conf
+	source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
+	WRITERS="${WRITERS:-${DEFAULT_WRITERS:-}}"
+	LIVE_WRITER="${LIVE_WRITER:-${WRITERS%% *}}"
+	# Does the write backend require a service on the servers?
+	W_SERVICE=0
+	{
+		PLUGIN_SERVICE=0
+		source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
+		W_SERVICE="${PLUGIN_SERVICE:-0}"
+	} 2>/dev/null
+
+	# Does the query backend require a service, and what data can it read?
+	Q_SERVICE=0
+	Q_READS=""
+	{
+		PLUGIN_SERVICE=0 PLUGIN_READS=""
+		source "${BENCH_DIR}/backends/${QUERY_BACKEND}/${QUERY_BACKEND}_backend.conf"
+		Q_SERVICE="${PLUGIN_SERVICE:-0}"
+		Q_READS="${PLUGIN_READS:-}"
+	} 2>/dev/null
+
+	# Re-source the write backend so its settings (not the query backend's)
+	# are the ones forwarded to the write nodes.
+	source "${BENCH_DIR}/backends/${WRITE_BACKEND}/${WRITE_BACKEND}_backend.conf"
+
+	# The query backend must be able to read what the write backend produced.
+	if [[ -n "${Q_READS}" && " ${Q_READS} " != *" ${WRITE_BACKEND} "* ]]; then
+		echo "backend '${QUERY_BACKEND}' cannot query data written by '${WRITE_BACKEND}' (it reads: ${Q_READS})" >&2
+		exit 1
+	fi
+
+	[[ -n "${WRITERS}" ]] || { echo "no WRITERS set and backend ${WRITE_BACKEND} has no DEFAULT_WRITERS" >&2; exit 1; }
+
+	# Settings forwarded to every remote step so that environment overrides
+	# given to run.sh apply on all nodes, not only here.
+	CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_HOSTS QUERY_HOST BENCH_DIR RUN_DIR RESULTS_DIR
+		ENV_SETUP PYTHON DATASET WRITERS DATA_NAME COMPONENT_IDS_PER_SERVER SAMPLES T0
+		INTERVAL JOB_LEN BATCH QUERY_ADAPTER QUERY_FILE REPEAT LIMIT_N
+		LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL)
+	# Forward each plugin's own settings too, from both backends.
+	for _bc in "${WRITE_BACKEND}" "${QUERY_BACKEND}"; do
+		_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/${_bc}_backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"
+		for _v in ${_pv}; do
+			[[ " ${CONFIG_VARS[*]} " == *" ${_v} "* ]] || CONFIG_VARS+=("${_v}")
+		done
+	done
+
+	echo "monbench: pair=${PAIR_NAME} write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHER} servers=${SERVERS[*]} query-host=${QUERY_HOST}"
+	echo "          ${COMPONENT_IDS_PER_SERVER} component IDs x ${SAMPLES} samples per server, writers: ${WRITERS}"
+	echo "          data: ${RUN_DIR}"
+	echo "          results: ${RESULTS_DIR}"
+
+	for phase in "${RUN_PHASES[@]}"; do
+		say "phase: ${phase} (${PAIR_NAME})"
+		case "$phase" in
+		build) phase_build || FAILED=1 ;;
+		serve-write) phase_write_serve ;;
+		write) phase_write ;;
+		serve-query) phase_query_serve ;;
+		check) phase_check ;;
+		query) phase_query ;;
+		live) phase_live ;;
+		stop) phase_stop ;;
+		clean) phase_clean ;;
+		*) echo "unknown phase '$phase'" >&2; exit 2 ;;
+		esac
+	done
+
+	say "pair ${PAIR_NAME} done: $([[ $FAILED -eq 0 ]] && echo 'all steps succeeded' || echo 'one or more steps FAILED')"
+	[[ $FAILED -eq 0 ]] || OVERALL_FAILED=1
+}
+
+for _pair in "${PAIRS[@]}"; do
+	run_pair "${_pair%%:*}" "${_pair#*:}"
+done
+
+say "done: $([[ $OVERALL_FAILED -eq 0 ]] && echo 'all pairs succeeded' || echo 'one or more pairs FAILED')"
+exit $OVERALL_FAILED

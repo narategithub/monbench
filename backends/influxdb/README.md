@@ -104,7 +104,7 @@ environment):
 | `INFLUX_QUERY_LANG` | `sql` | `sql` or `influxql` |
 | `INFLUX_PRECISION` | `s` | Line-protocol timestamp precision: `ns`/`us`/`ms`/`s` |
 | `INFLUX_WRITE_BATCH` | `10000` | Records per write request/batch |
-| `INFLUX_DATA_DIR` | `${RUN_DIR}/data/${HOSTNAME}` | `influxdb3`'s data directory on each server node; override to place data on a specific mount |
+| `INFLUX_DATA_DIR` | `${RUN_DIR}/data/${HOSTNAME}` | `influxdb3`'s data directory on each server node; override to place data on a specific mount. `RUN_DIR` is already namespaced per write/query pair by `bin/run.sh`, so this needs no backend-name segment of its own |
 
 ### Examples
 

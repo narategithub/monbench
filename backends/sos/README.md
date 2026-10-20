@@ -120,7 +120,7 @@ Settings live in `backends/sos/sos_backend.conf` (override from the environment)
 | Setting | Default | Purpose |
 |---|---|---|
 | `SOS_PREFIX` | `/opt/ovis` | SOS installation prefix; used to build the C writer |
-| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}` | Container root; each server uses `SOS_DATA_ROOT/<server-id>/` |
+| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}` | Container root; each server uses `SOS_DATA_ROOT/<server-id>/`. `RUN_DIR` is already namespaced per write/query pair by `bin/run.sh`, so this needs no backend-name segment of its own; it shares the exact same default formula as `dsos_backend.conf`, so within a pair the two backends always agree on where the data is |
 | `SOS_STORAGE` | `mmos` | SOS storage type for new containers: `mmos` or `lsos` |
 | `SOS_ROW_LIMIT` | `4096` | Rows per batch fetched by the query adapter |
 

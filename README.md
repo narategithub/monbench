@@ -21,7 +21,7 @@ is the starting point for others.
 
 | Path | Purpose |
 |---|---|
-| `bench.conf.example` | Template for `bench.conf`: backend, hosts, paths, data-set size, query settings |
+| `bench.conf.example` | Template: copy to `bench.conf` and edit for your site (backend(s), hosts, paths, data-set size, query settings). `bench.conf` itself is not part of the repository |
 | `bin/run.sh` | Driver: runs each phase on the right nodes via ssh, Slurm or by hand |
 | `bin/node.sh` | Actions executed on a single node; calls the backend's hooks |
 | `core/dataset.py` | The data set: value rules, parameters, metadata files |
@@ -44,8 +44,10 @@ is the starting point for others.
 The suite separates writing from querying. `WRITE_BACKEND` names the backend
 that writes the data; `QUERY_BACKEND` names the one that queries it. They can
 be the same backend or different ones, depending on what you want to measure.
+(`BACKENDS` is the more general form of this — see "Running multiple backend
+pairs" below — and these two are only read when `BACKENDS` is empty.)
 
-Set both in `bench.conf`. The run stops with an error if a backend does not
+Set these in `bench.conf`. The run stops with an error if a backend does not
 exist, if its data was written for a different backend, or if the query
 adapter cannot reach it.
 
@@ -160,6 +162,11 @@ bin/run.sh -l ssh query               # time — run as many times as needed
 bin/run.sh -l ssh stop                # stop both services when done
 ```
 
+When `BACKENDS` names more than one write/query pair (see "Running multiple
+backend pairs" below), every phase given on the command line runs once per
+pair, in order, before moving to the next pair; `deploy` is the exception and
+only runs once regardless of how many pairs are configured.
+
 ### Launchers
 
 | Launcher | How it runs steps | When to use |
@@ -218,9 +225,12 @@ records, the row count never decreases, and the final count is reached.
 
 ## Quick start
 
-1. Copy `bench.conf.example` to `bench.conf` and edit it: at minimum
-   `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_HOSTS`, `QUERY_HOST` and,
-   if the backend's software is not on the default paths, `ENV_SETUP`.
+1. Copy `bench.conf.example` to `bench.conf` and edit the "edit these" block
+   near the top: `BACKENDS` (or `WRITE_BACKEND`/`QUERY_BACKEND`),
+   `SERVER_HOSTS`, `QUERY_HOST` and, if the backend's software is not on the
+   default paths, `ENV_SETUP`. `bin/run.sh` refuses to run until these are
+   set — `bench.conf` names your real hosts and paths, so keep it local
+   rather than committing it.
 2. Edit `backends/<BACKEND>/<BACKEND>_backend.conf` for each backend you
    are using (see `backends/<n>/README.md` for what each setting does).
 3. Run the full sequence:
@@ -245,18 +255,63 @@ SAMPLES=500 WRITERS=c bin/run.sh -l ssh all
 
 ## Running multiple backend pairs
 
-To benchmark several write→query pairs (e.g. sos→dsos and influxdb→influxdb)
-without editing one config file back and forth, keep a separate `bench.conf`
-per pair and select it with `-c`:
+To benchmark several write→query pairs (e.g. `sos→dsos` and
+`influxdb→influxdb`) against the same `SERVER_HOSTS`/`QUERY_HOST` and the
+same data set and query file, set `BACKENDS` in `bench.conf` instead of
+`WRITE_BACKEND`/`QUERY_BACKEND`: a space-separated list of `writer` or
+`writer:query` tokens (`query` defaults to `writer` when omitted):
+
+```bash
+BACKENDS="sos:dsos influxdb"
+```
+
+`bin/run.sh` runs every phase you give on the command line once per pair, in
+order, before moving to the next pair:
+
+```bash
+bin/run.sh -l ssh all
+```
+
+Every other setting in `bench.conf` — `DATASET`, `QUERY_FILE`, `SAMPLES`,
+`REPEAT`, and so on — is shared by every pair, so all backends are measured
+against exactly the same data and the same questions.
+
+Both `RUN_DIR` and `RESULTS_DIR` gain a subdirectory named after the pair
+(`sos-dsos`, `influxdb`, derived from the backend names themselves). That
+name is fixed once per pair (before any of its phases run) and reused by
+every phase in it — build, write, check, query, and so on — regardless of
+which single backend, write or query, is actually doing the work for a
+given phase. That is what keeps a pair's write and query sides agreeing on
+where the data is: for `sos:dsos`, the write phase (handled by `sos`) and
+the check/query phases (handled by `dsos`, reading the very same on-disk
+containers `sos` wrote) both resolve `RUN_DIR` from the one fixed
+`sos-dsos` pair name, rather than from whichever single backend happens to
+be running that particular phase — keying it by whichever backend is
+active for a given phase (`sos` while writing, `dsos` while querying) is
+what causes them to disagree. The same per-pair namespacing on
+`RESULTS_DIR` (and its `logs/` subdirectory) is also what keeps e.g.
+`sos→sos` and `sos→dsos` results apart, since those legitimately differ
+even when the data underneath is identical.
+
+Because `RUN_DIR` is namespaced per pair, each pair writes its own copy of
+the data, even when two pairs share a writer (e.g. comparing `sos→sos`
+against `sos→dsos`): give each pair its own `write` (or `all`) to populate
+its own `RUN_DIR` — the second pair does not inherit the first's data.
+
+This only works when every pair can share one `SERVER_HOSTS`/`QUERY_HOST`/
+`ENV_SETUP`. If you need different hosts, or environment setup that
+conflicts between backends, keep a separate `bench.conf`-style file per pair
+instead (each your own, outside the repository, same as `bench.conf`
+itself) and select each with `-c`:
 
 ```bash
 bin/run.sh -c bench-sos-dsos.conf -l ssh all
-bin/run.sh -c bench-influxdb3.conf -l ssh all
+bin/run.sh -c bench-influxdb.conf -l ssh all
 ```
 
-Each config sets its own `WRITE_BACKEND`, `QUERY_BACKEND`, `SERVER_HOSTS`,
-`QUERY_HOST` and any backend-specific settings. Results go to each config's
-own `RESULTS_DIR`.
+Each file sets its own `BACKENDS` (or `WRITE_BACKEND`/`QUERY_BACKEND`),
+`SERVER_HOSTS`, `QUERY_HOST`, `RUN_DIR` and any backend-specific settings,
+and its own `RESULTS_DIR`.
 
 ## Query sets
 

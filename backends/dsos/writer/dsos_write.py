@@ -64,8 +64,7 @@ def get_schema(cont, tmpl, Sos):
     if schema is None:
         schema = Sos.Schema()
         schema.from_template(tmpl)
-        schema.add(cont)
-        schema = cont.schema_by_name(tmpl["name"])
+        schema = cont.schema_add(schema)
     return schema
 
 
@@ -134,9 +133,14 @@ def main():
 
     t_start = time.monotonic()
 
-    # Connect to the local dsosd through the session file.
+    # Connect to the local dsosd through the session file. PERM_CREAT makes
+    # this open-or-create, mirroring sos_write.c's SOS_PERM_CREAT|SOS_PERM_RW
+    # -- without it, open() requires the container to already exist, which
+    # it never will since dsos_plugin.sh's plugin_write only records the
+    # target -> path mapping in dsosd's directory file, it doesn't create
+    # anything on disk itself.
     session = Sos.Session(a.session)
-    cont = session.open(a.target, o_perm=Sos.PERM_RW)
+    cont = session.open(a.target, o_perm=Sos.PERM_RW | Sos.PERM_CREAT)
 
     schema = get_schema(cont, template["node"], Sos)
     attr_ids = {n: schema.attr_by_name(n).attr_id() for n in ds.attr_names}
@@ -147,7 +151,7 @@ def main():
     written = errors = in_batch = 0
     t_write = time.monotonic()
 
-    cont.begin()
+    cont.transaction_begin()
     for seq in range(a.samples):
         for c in range(a.components):
             comp = base + c
@@ -184,15 +188,15 @@ def main():
             in_batch += 1
             if in_batch == a.batch:
                 cont.commit()
-                cont.end()
+                cont.transaction_end()
                 in_batch = 0
-                cont.begin()
+                cont.transaction_begin()
             if a.rate > 0:
                 wait = t_write + written / a.rate - time.monotonic()
                 if wait > 0:
                     time.sleep(wait)
     cont.commit()
-    cont.end()
+    cont.transaction_end()
     t_indexed = time.monotonic()
 
     cont.close()

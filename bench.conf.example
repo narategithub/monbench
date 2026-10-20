@@ -1,41 +1,68 @@
 # monbench configuration -- sourced by bin/run.sh and bin/node.sh (bash syntax).
+# Copy this file to bench.conf and edit it for your site. bench.conf is not
+# part of the repository -- it names your real hosts and paths, so keep it
+# local (see the "edit these" block right below).
+#
 # Every value may be overridden from the environment, e.g.
 #   SAMPLES=100 bin/run.sh -l ssh all
 # Backend-specific settings are in backends/<name>/<name>_backend.conf.
 
-# ---------------------------------------------------------------- backends
-# Which backend writes the data, and which queries it. Each is the name of a
-# directory under backends/. They are usually the same, but the primary
-# real-world case here is writing with sos and querying with dsos.
+# ============================================================ edit these
+# These have no usable default for a new site -- bin/run.sh refuses to run
+# until they are set, here or in the environment.
+
+# Which backend(s) to benchmark: a space-separated list of "writer" or
+# "writer:query" tokens (query defaults to writer when omitted). Each name
+# is a directory under backends/. One token is a single write/query pair;
+# several run one after another against the same SERVER_HOSTS/QUERY_HOST
+# and the same data set and query file below -- see "Running multiple
+# backend pairs" in README.md.
 #   sos      write local SOS containers (C or Python); can also query them
 #            directly on disk (no dsosd needed)
 #   dsos     query SOS containers across servers through dsosd
 #   influxdb write and query InfluxDB v3
-WRITE_BACKEND="${WRITE_BACKEND:-sos}"
-QUERY_BACKEND="${QUERY_BACKEND:-dsos}"
+# Examples:
+#   BACKENDS="sos:dsos"            # the primary HPC deployment
+#   BACKENDS="sos:dsos influxdb"   # also compare against InfluxDB
+BACKENDS="${BACKENDS:-}"
 
-# ---------------------------------------------------------------- nodes
-# Server hosts (each holds one partition of the data set) and one query host.
-# The names must resolve from every node. With the Slurm launcher, unless
-# SERVER_HOSTS is set in the environment, the hosts come from the allocation:
-# the first two become servers and the third becomes the query host.
-SERVER_HOSTS="${SERVER_HOSTS:-node01 node02}"
-QUERY_HOST="${QUERY_HOST:-login01}"
+# Server hosts (each holds one partition of the data set) and one query
+# host. The names must resolve from every node. Shared by every pair named
+# in BACKENDS above -- they are not set per pair. With the Slurm launcher,
+# unless SERVER_HOSTS is set here or in the environment, the hosts are
+# filled from the allocation instead (see README.md).
+SERVER_HOSTS="${SERVER_HOSTS:-}"    # e.g. "node01 node02"
+QUERY_HOST="${QUERY_HOST:-}"        # e.g. "login01"
+
+# Commands evaluated before every step on every node, to put the backend
+# software on PATH/LD_LIBRARY_PATH/PYTHONPATH. Leave empty if it is already
+# on the default paths. If BACKENDS names more than one backend, this must
+# set up everything every one of them needs.
+ENV_SETUP="${ENV_SETUP:-}"          # e.g. "source /etc/profile.d/ovis.sh"
+# ==========================================================================
+
+# ------------------------------------------------- alternative to BACKENDS
+# For a single write/query pair, these two are equivalent to a one-token
+# BACKENDS and are only read when BACKENDS above is empty.
+WRITE_BACKEND="${WRITE_BACKEND:-}"
+QUERY_BACKEND="${QUERY_BACKEND:-}"
 
 # ---------------------------------------------------------------- paths
 # BENCH_DIR must exist at the same path on all nodes. On a shared filesystem
 # nothing needs copying; otherwise run 'bin/run.sh -l ssh deploy'.
 BENCH_DIR="${BENCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-# Per-node scratch area for logs, pid files and generated files.
+# Per-node scratch area for logs, pid files and generated files. Also the
+# root each backend's on-disk data is placed under (see e.g. SOS_DATA_ROOT,
+# INFLUX_DATA_DIR in each backend's own config). When BACKENDS names more
+# than one pair, bin/run.sh appends a subdirectory named after each pair, so
+# they never share a path.
 RUN_DIR="${RUN_DIR:-/tmp/monbench-${USER:-$(id -un)}/run}"
-# Where write summaries, metadata files and query results are stored.
+# Where write summaries, metadata files and query results are stored. Like
+# RUN_DIR, this gains a per-pair subdirectory when BACKENDS names more than
+# one pair.
 RESULTS_DIR="${RESULTS_DIR:-${BENCH_DIR}/results}"
 
 # ---------------------------------------------------------------- software
-# Commands evaluated before every step on every node, e.g. to put the
-# backend's software on PATH, LD_LIBRARY_PATH and PYTHONPATH:
-#   ENV_SETUP="source /etc/profile.d/ovis.sh"
-ENV_SETUP="${ENV_SETUP:-}"
 PYTHON="${PYTHON:-python3}"
 
 # ---------------------------------------------------------------- data set
