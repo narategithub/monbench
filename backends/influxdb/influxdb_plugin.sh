@@ -2,14 +2,18 @@
 #
 # Hooks (see backends/README.md for the contract):
 #   plugin_write       WRITER TARGET MODE INDEX ID  write one partition
-#   plugin_serve_start ID                           generate a token (offline),
+#   plugin_serve_start ID                           on the designated server host only;
+#                                                   generate a token (offline),
 #                                                   start influxdb3, create the
 #                                                   database
 #   plugin_serve_run   ID                           foreground influxdb3
 #                                                   (slurm launcher)
-#   plugin_serve_stop                               stop influxdb3
+#                                                   sane designated-host-only rule
+#   plugin_serve_stop                               stop influxdb3 (no-op
+#                                                   where nothing was started)
 #   plugin_clean       ID                           remove data directory and
 #                                                   generated token file
+#                                                   (no-op where neither exists)
 #
 # No build step (the writer is Python).
 # Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, dataset_args
@@ -24,6 +28,14 @@
 # passed explicitly to run_logged (see bin/node.sh's run_logged doc comment)
 # -- the logged line is then standalone-runnable, not just a record of what
 # ran inside this script.
+#
+# Single-instance model:
+#   InfluxDB 3 Core is single-node; there is no clustering mode. The harness
+#   runs exactly one influxdb3 server -- on the designated host extracted from
+#   INFLUX_HOST -- and has every other SERVER_HOSTS entry send its writes to
+#   that host over HTTP. The serve hooks (start, run, stop) and clean no-op
+#   on non-designated hosts; plugin_write runs on every host (it only sends
+#   HTTP requests, it does not need a local server).
 
 INFLUX_DIR="${BENCH_DIR}/backends/influxdb"
 
@@ -31,6 +43,18 @@ INFLUX_DIR="${BENCH_DIR}/backends/influxdb"
 # and clean wipes everything in one place.
 _INFLUX_PID="${RUN_DIR}/influxdb3.pid"
 _INFLUX_LOG="${RUN_DIR}/influxdb3.log"
+
+# The designated InfluxDB host: extracted from the INFLUX_HOST URL. Only
+# this hostname runs influxdb3; every other SERVER_HOSTS entry is a remote
+# writer that sends data over HTTP to this host.
+_INFLUX_SERVER_HOST="$(echo "${INFLUX_HOST}" | sed -E 's|^https?://||; s|:[0-9]+$||')"
+
+# True when the current host ($HOST, set by node.sh) is the designated
+# InfluxDB server host. Used by the serve and clean hooks to no-op on
+# non-designated hosts.
+_influx_is_server_host() {
+	[[ "${HOST}" == "${_INFLUX_SERVER_HOST}" ]]
+}
 
 # ----------------------------------------------------------------- write
 
@@ -81,6 +105,11 @@ _influx_read_token() {
 # ----------------------------------------------------------------- serve
 
 plugin_serve_start() { # SERVER_ID
+	if ! _influx_is_server_host; then
+		log "not the designated InfluxDB host (${_INFLUX_SERVER_HOST}); skipping serve-start"
+		return 0
+	fi
+
 	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
 
 	log "+ influxdb3 serve --node-id ${HOST} --object-store file --data-dir ${INFLUX_DATA_DIR} --admin-token-file ${INFLUX_TOKEN_FILE}"
@@ -133,6 +162,18 @@ plugin_serve_start() { # SERVER_ID
 }
 
 plugin_serve_run() { # SERVER_ID  (foreground; used by the slurm launcher)
+	if ! _influx_is_server_host; then
+		log "not the designated InfluxDB host (${_INFLUX_SERVER_HOST}); skipping serve-run"
+		# In the Slurm launcher this step stays alive as a background srun;
+		# sleep so the step does not exit (and get cleaned up) immediately.
+		# It will be killed by serve-stop's srun pid cleanup.
+		if [[ -z "${DRY_RUN:-}" ]]; then
+			log "sleeping until stopped (non-server placeholder)"
+			sleep infinity || true
+		fi
+		return 0
+	fi
+
 	# The token file must already exist (serve_start ran first in the slurm
 	# flow before serve_run is called for background operation).
 	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
@@ -149,6 +190,11 @@ plugin_serve_run() { # SERVER_ID  (foreground; used by the slurm launcher)
 }
 
 plugin_serve_stop() {
+	if ! _influx_is_server_host; then
+		log "not the designated InfluxDB host (${_INFLUX_SERVER_HOST}); nothing to stop"
+		return 0
+	fi
+
 	if [[ -n "${DRY_RUN:-}" ]]; then
 		log "+ (dry run) would stop influxdb3 using ${_INFLUX_PID}"
 		return 0
@@ -171,6 +217,11 @@ plugin_serve_stop() {
 # ----------------------------------------------------------------- clean
 
 plugin_clean() { # SERVER_ID
+	if ! _influx_is_server_host; then
+		log "not the designated InfluxDB host (${_INFLUX_SERVER_HOST}); nothing to clean"
+		return 0
+	fi
+
 	plugin_serve_stop
 	if [[ -d "${INFLUX_DATA_DIR}" ]]; then
 		run_logged rm -rf "${INFLUX_DATA_DIR}"

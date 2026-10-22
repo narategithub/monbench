@@ -12,9 +12,75 @@ server, so together the nodes write the whole data set once.
 | Write | Yes, to one InfluxDB 3 server (`INFLUX_HOST`) |
 | Query | Yes, via the Python client (Arrow Flight) or the HTTP query API |
 | Reads data written by | `influxdb` |
-| Service | Yes (`PLUGIN_SERVICE=1`); the harness starts and stops `influxdb3` and generates its admin token |
+| Service | Yes (`PLUGIN_SERVICE=1`); the harness starts and stops `influxdb3` and generates its admin token, on the designated server host only (see "Edition & version" and "How writing works with multiple server hosts" below) |
 | Partitioning | Data is generated per server but all sent to one server, not sharded |
 | List attributes (design/value-generation.md Sec 6) | Yes -- see "List attribute data model mapping" below |
+
+## Edition & version
+
+This backend runs **InfluxDB 3 Core** — the open source, single-node time
+series engine (MIT/Apache 2) — via the plain `influxdb3 serve` binary with
+`--object-store file`. It does not use, and cannot drive, **InfluxDB 3
+Enterprise** or **InfluxDB Clustered**, the commercial products that add
+clustering, replication and high availability on top of Core. Core has no
+mode where one logical database spans several nodes, so no setting in this
+harness can make that happen — `SERVER_HOSTS` with more than one entry does
+not give you a multi-node *database*; see "How writing works with multiple
+server hosts" below for what it does give you.
+
+The Core version in effect is whatever `influxdb3` resolves to on the
+server host's `PATH`; this repo does not pin or install a specific build.
+`plugin_serve_start` logs `influxdb3 --version` to the server's
+`influxdb3.log` under `RUN_DIR` on every run — check that log (or run
+`influxdb3 --version` yourself on the server host) before comparing numbers
+across runs or machines.
+
+## How writing works with multiple server hosts
+
+Because Core cannot cluster, there is exactly **one** real `influxdb3`
+server for an entire run: the host named by `INFLUX_HOST` (by default, the
+*first* entry in `SERVER_HOSTS`). Only that host runs `influxdb3`;
+`plugin_serve_start`/`plugin_serve_run` no-op on every other `SERVER_HOSTS`
+entry. The plugin determines the designated host by extracting the hostname
+from `INFLUX_HOST` and comparing it with the current node's `$HOST`
+(`hostname -s`); when they don't match, the serve and clean hooks return
+immediately.
+
+Every `SERVER_HOSTS` entry, however, runs its own `influx_write.py` process —
+that's the sense in which this backend supports multiple server hosts: each
+host generates and sends its own partition of the data set (a disjoint
+slice of component IDs) to the one real server, so together they write the
+whole data set once, concurrently, as several independent clients. Listing
+more hosts in `SERVER_HOSTS` for this backend means more concurrent writer
+load against one database, not more storage nodes.
+
+## Auth
+
+`plugin_serve_start` generates an admin token offline (on the one
+designated server host only) before starting `influxdb3`, writes it to
+`INFLUX_TOKEN_FILE` (a JSON file under `RUN_DIR`), and passes that file to
+the server via `--admin-token-file`. Every write and query step — wherever
+it runs — reads the token back from that same file (`_influx_read_token` in
+`influxdb_plugin.sh`). No token needs to be set in `bench.conf` or the
+environment, and `plugin_serve_start` also creates `INFLUX_DATABASE`
+automatically.
+
+Because only the designated host generates a token, there is no risk of a
+second instance overwriting `INFLUX_TOKEN_FILE` with a different token.
+All writers and the query adapter read the same file and therefore use the
+same token the single server recognizes.
+
+## Query side
+
+`check`/`query` always run on the single `QUERY_HOST`, never on a
+`SERVER_HOSTS` entry, and always against the same one `INFLUX_HOST` server.
+The adapter is chosen by `INFLUX_INTERFACE` (`python`: the
+`influxdb_client_3` library over Arrow Flight; `http`: the HTTP query API)
+and the query language by `INFLUX_QUERY_LANG` (`sql` or `influxql`; see
+`query/influxdb_query.py`). Authentication uses the same admin token file
+described above — this relies on `QUERY_HOST` and every `SERVER_HOSTS` entry
+resolving `RUN_DIR` to the same path (true for this harness's `ssh`/`slurm`
+launchers).
 
 ## Data model mapping
 
@@ -90,6 +156,21 @@ Arrow Flight; `http` uses the query API). Query strings for InfluxDB go in a
 query set under the `influxdb` adapter name. List-attribute queries (see
 above) need the `sql` dialect -- InfluxQL has no JOIN.
 
+## Architectural contrast with SOS/DSOS
+
+SOS and DSOS run a store on every server node; each node writes to its own
+local containers, and the query side either reads one node's containers
+directly (SOS) or aggregates across nodes through `dsosd` (DSOS). InfluxDB
+3 Core cannot do this — it is a single-process, single-node engine. The
+harness therefore treats InfluxDB differently:
+
+| Aspect | SOS / DSOS | InfluxDB |
+|---|---|---|
+| Server process | one per `SERVER_HOSTS` entry | one total (designated host) |
+| Data directory | per-host, local | one, on the designated host |
+| Writer transport | local library call or local file I/O | HTTP POST to `INFLUX_HOST` |
+| Token / auth | N/A (file permissions) | single token generated once, shared via `INFLUX_TOKEN_FILE` |
+
 ## Configuration
 
 Settings live in `backends/influxdb/influxdb_backend.conf` (override from the
@@ -97,14 +178,14 @@ environment):
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `INFLUX_HOST` | `http://<first SERVER_HOSTS host>:8181` | InfluxDB 3 server URL, reachable from all nodes |
+| `INFLUX_HOST` | `http://<first SERVER_HOSTS host>:8181` | InfluxDB 3 server URL, reachable from all nodes; also the host where `influxdb3` actually runs (see "How writing works with multiple server hosts") |
 | `INFLUX_DATABASE` | `monbench` | Database to write to and query; created automatically by `plugin_serve_start` |
 | `INFLUX_TOKEN_FILE` | `${RUN_DIR}/influxdb3-token.json` | Path to the admin token file generated by `plugin_serve_start`; set automatically, override only if managing the token yourself |
 | `INFLUX_INTERFACE` | `python` | `python` or `http` (write and query) |
 | `INFLUX_QUERY_LANG` | `sql` | `sql` or `influxql` |
 | `INFLUX_PRECISION` | `s` | Line-protocol timestamp precision: `ns`/`us`/`ms`/`s` |
 | `INFLUX_WRITE_BATCH` | `10000` | Records per write request/batch |
-| `INFLUX_DATA_DIR` | `${RUN_DIR}/data/${HOSTNAME}` | `influxdb3`'s data directory on each server node; override to place data on a specific mount. `RUN_DIR` is already namespaced per write/query pair by `bin/run.sh`, so this needs no backend-name segment of its own |
+| `INFLUX_DATA_DIR` | `${RUN_DIR}/influxdb-data` | `influxdb3`'s data directory on the designated server host; override to place data on a specific mount (e.g. a fast local disk on the InfluxDB host). `RUN_DIR` is already namespaced per write/query pair by `bin/run.sh`, so this needs no backend-name segment of its own |
 
 ### Examples
 
@@ -121,9 +202,9 @@ QUERY_BACKEND=influxdb INFLUX_QUERY_LANG=influxql bin/run.sh -l ssh check
 
 ## Requirements
 
-- An InfluxDB 3 server reachable at `INFLUX_HOST`. Auth is handled by the
-  harness: `plugin_serve_start` generates an admin token offline and creates
-  `INFLUX_DATABASE` before the write or query steps run — no token or
-  database needs to be set up in advance.
+- An InfluxDB 3 **Core** server reachable at `INFLUX_HOST`. Auth is handled
+  by the harness: `plugin_serve_start` generates an admin token offline and
+  creates `INFLUX_DATABASE` before the write or query steps run — no token
+  or database needs to be set up in advance.
 - For the `python` interface: `pip install influxdb3-python` on the write (and
   query) nodes. The `http` interface needs only the Python standard library.
