@@ -67,6 +67,13 @@ def get_schema(cont, tmpl, Sos):
         schema = cont.schema_add(schema)
     return schema
 
+def create_obj(schema, obj):
+    try:
+        schema.obj_create(obj)
+        return 0
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
 class ListWriter:
     """Mirrors sos_write.py's ListWriter -- one list attribute's schema
@@ -101,7 +108,7 @@ class ListWriter:
             obj[aid] = int(v)
 
     def write(self, comp, job_id, seq, ts, rec, ds, name):
-        obj = self.schema.alloc()
+        obj = self.schema.malloc()
         obj[self.attr_ids["timestamp"]] = (int(ts), 0)
         obj[self.attr_ids["component_id"]] = int(comp)
         obj[self.attr_ids["job_id"]] = int(job_id)
@@ -113,7 +120,7 @@ class ListWriter:
                           rec[attr_name])
         else:
             self._set(obj, "value", ds.list_tuple_type(name), rec["value"])
-        rc = obj.index_add()
+        rc = create_obj(self.schema, obj)
         obj.release()
         return rc
 
@@ -156,7 +163,7 @@ def main():
         for c in range(a.components):
             comp = base + c
             values = ds.expected(comp, seq)
-            obj = schema.alloc()
+            obj = schema.malloc()
             for name in ds.attr_names:
                 aid = attr_ids[name]
                 v = values[name]
@@ -168,7 +175,7 @@ def main():
                     obj[aid] = str(v)
                 else:
                     obj[aid] = int(v)
-            rc = obj.index_add()
+            rc = create_obj(schema, obj)
             obj.release()
             if rc:
                 errors += 1
