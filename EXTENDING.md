@@ -77,6 +77,16 @@ The writer's summary line is a single JSON object on stdout, for example:
 
 The harness records it and prints these fields: `writer`, `records`, `write_s`, `close_sync_s`, `records_per_s`.
 
+#### Supporting `bin/run.sh -d` (dry run)
+
+`node.sh` defines `run_logged CMD ARGS...` (next to `log`/`die`, before your plugin is sourced): it logs a command's argv as a `"+ ...​"` line and then runs it, unless `DRY_RUN` is set, in which case it only logs. Route any plain external command your hooks run through it — the writer invocation in `plugin_write`, a compiler in `plugin_build`, `rm`/cleanup in `plugin_clean` — so `bin/run.sh -d` reports your backend's real commands too, consistently with the others.
+
+If your command reads a setting from its own environment rather than from an argv flag — most writers do this for `DATASET` — name it explicitly as `run_logged VAR=val -- CMD ARGS...` (note the literal `--`) instead of just `run_logged CMD ARGS...`. `run_logged` logs those `VAR=val` assignments as part of the `"+ ...​"` line and, for a real run, exports exactly those vars for `CMD` (equivalent to writing `VAR=val CMD ARGS...` by hand). Without this, the logged line still runs correctly from inside `node.sh` (the var is already in its environment), but is not something you can copy out and run standalone on the node — see `backends/sos/sos_plugin.sh`'s and `backends/dsos/dsos_plugin.sh`'s `plugin_write` (both pass `DATASET` this way) for examples, and `bin/node.sh`'s `run_logged` doc comment for the exact rule (only args before a literal `--` are treated as env assignments; with no `--` anywhere, everything is CMD/ARGS as before, so existing calls with no env vars need no change).
+
+A command that must be backgrounded or `exec`'d (typically in `plugin_serve_start`/`plugin_serve_run`) can't go through `run_logged` directly: log your own `"+ ...​"` line (including any `VAR=val` prefix the command needs, the same way) and check `[[ -n "${DRY_RUN:-}" ]]` yourself before actually starting or stopping anything. See `backends/sos/sos_plugin.sh` (`plugin_build`/`plugin_write`/`plugin_clean`) and `backends/dsos/dsos_plugin.sh` (`plugin_serve_start`/`plugin_serve_run`/`plugin_serve_stop`) for examples of both. If a hook reads a file that only a prior real (non-dry) step would have created (e.g. a token or session file), skip that read under `DRY_RUN` too — see `backends/influxdb/influxdb_plugin.sh`'s `plugin_write`.
+
+Separately, `bin/run.sh` itself now always prints the outer `env VAR=val ... bash bin/node.sh ACTION ARGS` line a step runs (for every launcher, not just `-l manual`) before running it — see `README.md`'s "Dry run" section and `bin/run.sh`'s "Reproducing a step by hand" comment. That line already carries every setting `CONFIG_VARS`/`PLUGIN_VARS` forward, so it needs nothing from you as a plugin author; `run_logged`'s `VAR=val --` convention above is only for a setting an external command you invoke reads from its own environment, which that outer line does not help with on its own once you're inside `node.sh`.
+
 ### The query adapter: `query/<n>_query.py`
 
 A Python module that defines one or more subclasses of `Adapter` from `core/adapter.py`, plus two module-level attributes:
@@ -184,6 +194,8 @@ bin/run.sh -c bench-mydb.conf -l ssh stop clean
 ```
 
 Start with a small dataset (`SAMPLES=100 COMPONENT_IDS_PER_SERVER=4`) to iterate quickly. Increase once the queries pass verification.
+
+`bin/run.sh -d` (see `README.md`, "Dry run") is also useful while wiring up a new plugin: it shows you the exact command each hook would run on each node without needing the backend's service, or even the writer binary, to actually work yet — see "Supporting `bin/run.sh -d` (dry run)" above for what your plugin needs for this to work, and for how to make the logged line copy-pasteable as a standalone command, not just a record of what ran.
 
 ## Defining a custom dataset
 

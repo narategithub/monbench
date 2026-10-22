@@ -28,6 +28,7 @@ structure:
   "target":    "<target name>",
   "dataset":   { ... },           # data set parameters (see below)
   "servers":   ["host1", ...],    # server hosts used
+  "dry_run":   true|false,        # true if DRY_RUN was set for this run (see below)
   "ingest":    { ... },           # write-side results (see below)
   "query":     { ... },           # query-side results (see below)
   "all_passed": true|false        # false if any check failed
@@ -46,6 +47,17 @@ The data set parameters used for this run.
 | `t0` | timestamp of the first sample (Unix seconds) |
 | `interval` | seconds between consecutive samples |
 | `job_len` | samples per job |
+
+### `dry_run`
+
+`true` when `DRY_RUN` was set for this `check`/`query` run (`bin/run.sh -d`,
+forwarded as `DRY_RUN=1` — see `README.md`, "Dry run"). When `true`, every
+entry in `query.results` has status `DRY`: each query's final text was
+resolved and is reported, but `core/bench.py` never called
+`adapter.connect()`, and never called `adapter.query()`/`count()`/`records()`
+for any query. `ingest` is unaffected by this field — it reflects whatever
+the most recent real `write` produced; a dry `query`/`check` run does not
+write a new `ingest` section.
 
 ### `ingest`
 
@@ -109,7 +121,7 @@ Query-side results from the benchmark engine.
 | `repeat` | number of timed runs per query (from `REPEAT` in bench.conf) |
 | **Per-query fields** | |
 | `name` | query label from the query set file |
-| `status` | `PASS`, `FAIL`, `INFO`, or `SKIP` |
+| `status` | `PASS`, `FAIL`, `INFO`, `SKIP`, or `DRY` |
 | `rows` | number of rows returned |
 | `verified` | `true` if the result was verified against the data set |
 | `query` | the expanded query string that was executed |
@@ -124,6 +136,9 @@ When `mode` is `check`, the timing fields (`times_s`, `median_s`, `p95_s`,
 `min_s`, `rows_per_s`) are absent. When `mode` is `query`, `verified` is
 always `false`.
 
+A `DRY` entry (top-level `dry_run` is `true` — see above) has `query`
+present but no timing fields, `rows` is `null`, and `verified` is `false`:
+the query's final text was resolved and reported, but never sent.
 
 ## Live result JSON
 
@@ -158,6 +173,9 @@ live-poll behaviour:
 The `detail` field on each entry carries the specifics: poll counts for
 `rows never decrease`, the number of invalid answers for `every answer
 valid`, and the final vs expected count for `final count reached`.
+
+Under `DRY_RUN`, `live` reports a single `"live poll"` entry with status
+`DRY` instead of running any poll, and `dry_run` is `true` at the top level.
 
 
 ## What is timed
@@ -203,6 +221,10 @@ it is meant to be a trivial operation like `len(batch)`).
 
 The adapter's `connect()` and `close()` calls are outside the timed
 region — connection setup is measured once, not per query.
+
+Under `DRY_RUN` (see `dry_run` above), `timed_run()` is never called at
+all: each query is reported with status `DRY` as soon as its text is
+resolved, and `adapter.connect()` is never called either.
 
 ### Why they differ
 

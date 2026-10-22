@@ -186,6 +186,45 @@ In manual mode, change settings in the configuration files rather than in
 the shell environment, because the commands you type on the other nodes read
 only the files.
 
+Every launcher, not only `manual`, now prints the exact node-side command a
+step is about to run — `env VAR=val ... bash bin/node.sh ACTION ARGS...`,
+with every setting (`CONFIG_VARS`/`PLUGIN_VARS`) it needs already in that
+`env` prefix — before running it, and writes that same line to the step's
+log file under `results/<pair>/logs/`. It is self-contained: copy it onto
+the named host and it reproduces exactly what the harness ran, with or
+without `-d` (e.g. to attach a debugger or rerun one step by hand).
+
+### Dry run
+
+`-d` logs the exact command each phase would run on each server/query host,
+without actually running it:
+
+- `build`, `write`, `serve-start`/`serve-run`/`serve-stop` and `clean` log
+  the command they would run instead of running it — nothing is built,
+  written, started, stopped, or deleted.
+- `check` and `query` resolve and print every query's final, placeholder-
+  filled text exactly as it would be sent, but never connect to the backend
+  or actually send it (`core/bench.py`, which reports each query with status
+  `DRY` instead of checking or timing it — see `OUTPUT.md`).
+
+```bash
+bin/run.sh -d build write
+bin/run.sh -c bench-sos-dsos.conf -d check query
+```
+
+It works with the `ssh` and `slurm` launchers (`-d` is forwarded to every
+node as `DRY_RUN=1`); with `-l manual` you already see each command printed
+without running it, so `-d` adds little there besides also showing up in the
+printed environment assignments.
+
+A writer invocation's own logged line (from `run_logged()` inside
+`bin/node.sh`) includes any setting the writer reads from its own
+environment rather than from a flag — e.g. `DATASET`, which every writer
+needs — so that line too is standalone-runnable, not just a record of what
+ran. See `EXTENDING.md`, "Supporting `bin/run.sh -d` (dry run)", if you are
+writing a new backend's plugin and want your own commands to behave the
+same way.
+
 ### Verification
 
 The `check` phase runs each query through the backend's query adapter and

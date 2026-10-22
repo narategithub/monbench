@@ -12,8 +12,18 @@
 #                                                   generated token file
 #
 # No build step (the writer is Python).
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, dataset_args (array),
-# and every setting from bench.conf and influxdb_backend.conf.
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, dataset_args
+# (array), and every setting from bench.conf and influxdb_backend.conf.
+#
+# Set DRY_RUN=1 (bin/run.sh's -d flag) to log the write/serve command this
+# host would run (via run_logged() or an inline "+ ..." log line) without
+# actually writing, starting/stopping influxdb3, or deleting anything. Under
+# DRY_RUN, plugin_write logs with a placeholder token instead of reading one
+# from INFLUX_TOKEN_FILE, since a dry-run serve-write never created it. The
+# writer reads DATASET from its environment rather than a flag, so it is
+# passed explicitly to run_logged (see bin/node.sh's run_logged doc comment)
+# -- the logged line is then standalone-runnable, not just a record of what
+# ran inside this script.
 
 INFLUX_DIR="${BENCH_DIR}/backends/influxdb"
 
@@ -43,11 +53,12 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 		args+=("$a")
 	done
 
-	local token
-	token="$(_influx_read_token)"
+	local token="<token>"
+	[[ -n "${DRY_RUN:-}" ]] || token="$(_influx_read_token)"
 
 	log "writing ${DATA_NAME} to ${INFLUX_DATABASE} (influx writer, ${INFLUX_INTERFACE} interface) on ${INFLUX_HOST}"
-	"${PYTHON}" "${INFLUX_DIR}/writer/influx_write.py" \
+	run_logged DATASET="${DATASET}" -- \
+		"${PYTHON}" "${INFLUX_DIR}/writer/influx_write.py" \
 		--measurement "$DATA_NAME" --node-index "$index" \
 		"${args[@]}" --batch "${INFLUX_WRITE_BATCH}" \
 		--interface "${INFLUX_INTERFACE}" \
@@ -71,6 +82,12 @@ _influx_read_token() {
 
 plugin_serve_start() { # SERVER_ID
 	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
+
+	log "+ influxdb3 serve --node-id ${HOST} --object-store file --data-dir ${INFLUX_DATA_DIR} --admin-token-file ${INFLUX_TOKEN_FILE}"
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "dry run: token generation and influxdb3 startup skipped"
+		return 0
+	fi
 
         # Kill any leftover process from a previous run before starting a new one.
         pkill -f 'influxdb3 serve' 2>/dev/null || true
@@ -119,6 +136,11 @@ plugin_serve_run() { # SERVER_ID  (foreground; used by the slurm launcher)
 	# The token file must already exist (serve_start ran first in the slurm
 	# flow before serve_run is called for background operation).
 	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
+	log "+ influxdb3 serve --node-id ${HOST} --object-store file --data-dir ${INFLUX_DATA_DIR} --admin-token-file ${INFLUX_TOKEN_FILE}"
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "dry run: not exec'ing influxdb3"
+		return 0
+	fi
 	exec influxdb3 serve \
 		--node-id "${HOST}" \
 		--object-store file \
@@ -127,6 +149,10 @@ plugin_serve_run() { # SERVER_ID  (foreground; used by the slurm launcher)
 }
 
 plugin_serve_stop() {
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "+ (dry run) would stop influxdb3 using ${_INFLUX_PID}"
+		return 0
+	fi
 	if [[ -f "${_INFLUX_PID}" ]]; then
 		local pid
 		pid="$(cat "${_INFLUX_PID}")"
@@ -147,9 +173,9 @@ plugin_serve_stop() {
 plugin_clean() { # SERVER_ID
 	plugin_serve_stop
 	if [[ -d "${INFLUX_DATA_DIR}" ]]; then
-		rm -rf "${INFLUX_DATA_DIR}"
-		log "removed ${INFLUX_DATA_DIR}"
+		run_logged rm -rf "${INFLUX_DATA_DIR}"
+		[[ -n "${DRY_RUN:-}" ]] || log "removed ${INFLUX_DATA_DIR}"
 	fi
-	rm -f "${INFLUX_TOKEN_FILE}"
-	log "removed token at ${INFLUX_TOKEN_FILE}"
+	run_logged rm -f "${INFLUX_TOKEN_FILE}"
+	[[ -n "${DRY_RUN:-}" ]] || log "removed token at ${INFLUX_TOKEN_FILE}"
 }

@@ -19,6 +19,13 @@ the target was written. If it names a different backend, the run stops.
 
 '--live' polls a target that is still being written and checks that every
 answer is internally consistent and that the row count never decreases.
+
+Set DRY_RUN=1 in the environment (bin/run.sh's -d flag forwards it here, the
+same as for build/write/serve/clean) to resolve and print every query's
+final, placeholder-filled text without ever calling adapter.connect() or
+sending a query: each query is reported with status DRY instead of being
+checked or timed. No adapter changes are needed for this -- it is handled
+entirely here, before any adapter method that would touch the backend runs.
 """
 import argparse
 import importlib.util
@@ -57,6 +64,9 @@ LIVE_POLL = env("LIVE_POLL", float)
 REPEAT = env("REPEAT", int, "5")
 QUERY_ADAPTER = os.environ.get("QUERY_ADAPTER", "")
 QUERY_FILE = os.environ.get("QUERY_FILE") or os.path.join(BENCH_DIR, "queries", "default.json")
+# See the module docstring: resolves and reports every query's text without
+# ever connecting to the backend or sending it.
+DRY_RUN = bool(os.environ.get("DRY_RUN"))
 
 DS = None          # the Dataset being checked; set in main()
 
@@ -531,6 +541,14 @@ def run_query_set(rep, adapter, queries, mode="both"):
         # load_query_set, so the query is ready to send as-is.
         native_query = q["query"]
 
+        # DRY_RUN: the query is fully resolved (placeholders filled, columns
+        # mapped) above, so it is shown exactly as it would be sent, but
+        # never actually is -- adapter.query()/count()/records() are never
+        # called, and run_checks() never called adapter.connect() either.
+        if DRY_RUN:
+            rep.add(label, "DRY", "not sent (dry run)", query=q["query"])
+            continue
+
         status, detail = "INFO", ""
         nrows = 0
 
@@ -669,10 +687,13 @@ def run_checks(target, query_file, mode="both"):
     ingest = load_ingest_results(target)
     print("\nIngest performance:")
     print_ingest_summary(ingest)
-    try:
-        adapter.connect()
-    except BackendError as e:
-        sys.exit(f"bench.py: backend '{BACKEND}' check failed: {e}")
+    if DRY_RUN:
+        print("\nDRY RUN: not connecting to the backend; queries below are resolved but not sent.")
+    else:
+        try:
+            adapter.connect()
+        except BackendError as e:
+            sys.exit(f"bench.py: backend '{BACKEND}' check failed: {e}")
     queries = load_query_set(query_file, adapter)
 
     mode_desc = {"check": "verification only (no timing)",
@@ -686,7 +707,8 @@ def run_checks(target, query_file, mode="both"):
     try:
         run_query_set(rep, adapter, queries, mode=mode)
     finally:
-        adapter.close()
+        if not DRY_RUN:
+            adapter.close()
     return rep
 
 
@@ -702,6 +724,11 @@ def run_live(target):
                  if q["type"] == "all" and q["query"]), None)
     if not text:
         sys.exit(f"bench.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
+    if DRY_RUN:
+        print(f"DRY RUN: would poll '{target}' every {LIVE_POLL}s until {final} rows with:")
+        print(f"    {text}")
+        rep.add("live poll", "DRY", "not run (dry run)")
+        return rep
     # Column names and literal formats were already applied in load_query_set.
     print(f"Polling '{target}' every {LIVE_POLL}s until {final} rows")
     counts, invalid, errors = [], 0, 0
@@ -785,6 +812,7 @@ def main():
         "target": a.target,
         "dataset": DS.params(),
         "servers": SERVERS,
+        "dry_run": DRY_RUN,
         "ingest": {
             "backend": WRITE_BACKEND,
             "hosts": getattr(rep, "ingest", {}).get("hosts", []),

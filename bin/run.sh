@@ -2,7 +2,7 @@
 # run.sh -- drive the benchmark from one place, for the write/query backend
 # pair(s) named in bench.conf (plugins under backends/).
 #
-# usage: bin/run.sh [-c CONF] [-l ssh|slurm|manual] PHASE [PHASE...]
+# usage: bin/run.sh [-c CONF] [-l ssh|slurm|manual] [-d] PHASE [PHASE...]
 #
 # Phases (run in the order given):
 #   deploy       copy this directory to every node (ssh only; skipped where the
@@ -27,6 +27,31 @@
 #   ssh      run each step over ssh (default)
 #   slurm    run each step with srun inside an allocation (see slurm/)
 #   manual   print each step for you to run on the named node, then wait
+#
+# Dry run:
+#   -d   log the exact command each phase would run on each server/query
+#        host, without actually running it: build, write, serve-start/run/
+#        stop and clean log the command they would run instead of running
+#        it (nothing is built, written, started, stopped, or deleted); check
+#        and query resolve and print every query's final text without ever
+#        connecting to the backend or sending it (core/bench.py, status
+#        DRY in its report). Forwarded to every node as DRY_RUN=1, so
+#        ssh/slurm steps honor it too; with -l manual you already see the
+#        command without -d, so it has no extra effect there besides also
+#        appearing in the printed env assignments.
+#
+# Reproducing a step by hand: every launcher now logs the exact "env
+# VAR=val ... bash bin/node.sh ACTION ARGS..." line a step runs, to that
+# step's log file under RESULTS_DIR/logs (see remote() below) -- self-
+# contained, so it can be copied onto the named host and run as-is, with
+# or without -d. With -d (or -l manual), that line also prints to stdout,
+# since it IS the result there; on a real ssh/slurm run it only goes to
+# the log file, so stdout stays readable -- check the log file for it.
+# bin/node.sh's run_logged() goes further for the actual external command a
+# hook runs (the writer invocation, a build, a clean): see its doc comment
+# in bin/node.sh for how a command that reads a setting from its own
+# environment (e.g. every writer's DATASET) gets that logged too, rather
+# than only being visible because it was already set in node.sh's shell.
 #
 # Backend pairs:
 #   bench.conf names either one pair (WRITE_BACKEND/QUERY_BACKEND) or several,
@@ -58,15 +83,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$(cd "${HERE}/.." && pwd)/bench.conf"
 LAUNCHER="ssh"
 
-while getopts "c:l:h" opt; do
+while getopts "c:l:dh" opt; do
 	case "$opt" in
 	c) CONF="$(cd "$(dirname "$OPTARG")" && pwd)/$(basename "$OPTARG")" ;;
 	l) LAUNCHER="$OPTARG" ;;
-	*) sed -n '2,54p' "$0"; exit 2 ;;
+	d) DRY_RUN=1 ;;
+	*) sed -n '2,79p' "$0"; exit 2 ;;
 	esac
 done
 shift $((OPTIND - 1))
-[[ $# -gt 0 ]] || { sed -n '2,54p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,79p' "$0"; exit 2; }
 case "$LAUNCHER" in ssh | slurm | manual) ;; *) echo "unknown launcher '$LAUNCHER'" >&2; exit 2 ;; esac
 
 # In the Slurm launcher, empty host settings are filled from the allocation.
@@ -145,16 +171,40 @@ wait_for_user() {
 	{ read -r -p "   Press Enter when the step above has finished... " _ </dev/tty; } 2>/dev/null || true
 }
 
-# Run one node action and wait for it. Output goes to the terminal and to a
-# log file under RESULTS_DIR/logs.
+# Run one node action and wait for it. The node_cmd() line itself -- the
+# full "env VAR=val ... bash bin/node.sh ACTION ARGS" invocation, self-
+# contained with every setting the step needs -- is always written to the
+# step's log file under RESULTS_DIR/logs, so it can be copied onto the host
+# and rerun by hand (e.g. under gdb) exactly as the harness ran it. It also
+# prints to stdout under DRY_RUN (there is nothing else to show, and it IS
+# the result), and always for -l manual (showing it is manual mode's whole
+# job); on a real ssh/slurm run it stays out of stdout so the step's own
+# output (the part you're actually watching) isn't buried under it -- check
+# the log file if you need the exact command afterward.
 remote() { # HOST LOGNAME ACTION ARGS...
 	local host="$1" logname="$2"
 	shift 2
 	local cmd
 	cmd="$(node_cmd "$@")"
 	case "$LAUNCHER" in
-	ssh) ssh -n ${SSH_OPTS} "$host" "$cmd" 2>&1 | tee "${LOG_DIR}/${logname}.log"; return "${PIPESTATUS[0]}" ;;
-	slurm) srun ${SRUN_OPTS} -N1 -n1 -w "$host" bash -c "$cmd" 2>&1 | tee "${LOG_DIR}/${logname}.log"; return "${PIPESTATUS[0]}" ;;
+	ssh)
+		if [[ -n "${DRY_RUN:-}" ]]; then
+			printf '   on %s:\n     %s\n' "$host" "$cmd" | tee "${LOG_DIR}/${logname}.log"
+		else
+			printf '   on %s:\n     %s\n' "$host" "$cmd" >"${LOG_DIR}/${logname}.log"
+		fi
+		ssh -n ${SSH_OPTS} "$host" "$cmd" 2>&1 | tee -a "${LOG_DIR}/${logname}.log"
+		return "${PIPESTATUS[0]}"
+		;;
+	slurm)
+		if [[ -n "${DRY_RUN:-}" ]]; then
+			printf '   on %s:\n     %s\n' "$host" "$cmd" | tee "${LOG_DIR}/${logname}.log"
+		else
+			printf '   on %s:\n     %s\n' "$host" "$cmd" >"${LOG_DIR}/${logname}.log"
+		fi
+		srun ${SRUN_OPTS} -N1 -n1 -w "$host" bash -c "$cmd" 2>&1 | tee -a "${LOG_DIR}/${logname}.log"
+		return "${PIPESTATUS[0]}"
+		;;
 	manual)
 		printf '   On %s run:\n     %s\n' "$host" "$cmd"
 		wait_for_user
@@ -192,6 +242,10 @@ on_servers() { # LOGPREFIX ACTION ARGS...
 
 phase_deploy() {
 	[[ "$LAUNCHER" == "ssh" ]] || { echo "   deploy is only needed with the ssh launcher"; return 0; }
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		echo "   dry run: would copy ${BENCH_DIR} to ${SERVERS[*]} ${QUERY_HOST} (skipped)"
+		return 0
+	fi
 	local marker host id
 	marker="${BENCH_DIR}/.monbench-id"
 	[[ -f "$marker" ]] || od -An -N8 -tx8 /dev/urandom | tr -d ' ' >"$marker"
@@ -251,10 +305,16 @@ _phase_serve_backend() { # BACKEND_NAME SERVICE_FLAG LOG_PREFIX
 	slurm)
 		# A background srun step keeps the service alive; its pid is kept here
 		# so that 'stop' can end the step. Namespaced by pair so two pairs
-		# using the same host/prefix in one invocation don't clash.
+		# using the same host/prefix in one invocation don't clash. The
+		# node_cmd() line is logged first (to the log file only, same as
+		# remote() does for a real ssh/slurm run), so this backgrounded
+		# invocation is reproducible by hand too, not just the foreground ones.
+		local _cmd
 		for host in "${SERVERS[@]}"; do
-			srun ${SRUN_OPTS} -N1 -n1 -w "$host" bash -c "$(BE="${backend}" node_cmd serve-run "$host")" \
-				>"${LOG_DIR}/${prefix}-${host}.log" 2>&1 &
+			_cmd="$(BE="${backend}" node_cmd serve-run "$host")"
+			printf '   on %s:\n     %s\n' "$host" "$_cmd" >"${LOG_DIR}/${prefix}-${host}.log"
+			srun ${SRUN_OPTS} -N1 -n1 -w "$host" bash -c "$_cmd" \
+				>>"${LOG_DIR}/${prefix}-${host}.log" 2>&1 &
 			echo $! >"${STATE_DIR}/srun-${PAIR_NAME}-${prefix}-${host}.pid"
 		done
 		for host in "${SERVERS[@]}"; do
@@ -389,12 +449,10 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	# RUN_DIR and RESULTS_DIR: namespaced per pair, fixed once here for the
 	# whole pair's run and reused by every phase below (build, write, check,
 	# query, ...) regardless of which single backend -- write or query -- is
-	# actually doing the work for a given phase. That is what keeps e.g. a
-	# sos:dsos pair's write phase (handled by sos) and check/query phases
-	# (handled by dsos, reading the same on-disk containers sos wrote)
-	# agreeing on where the data is: both read the one fixed PAIR_NAME-
-	# derived RUN_DIR, rather than a path keyed by whichever single backend
-	# happens to be running that particular phase.
+	# actually doing the work for a given phase. That is what keeps a pair's
+	# write and query sides agreeing on where the data is: both read the one
+	# fixed PAIR_NAME-derived RUN_DIR, rather than a path keyed by whichever
+	# single backend happens to be running that particular phase.
 	RUN_DIR="${BASE_RUN_DIR}/${PAIR_NAME}"
 	RESULTS_DIR="${BASE_RESULTS_DIR}/${PAIR_NAME}"
 	LOG_DIR="${RESULTS_DIR}/logs"
@@ -444,7 +502,7 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_HOSTS QUERY_HOST BENCH_DIR RUN_DIR RESULTS_DIR
 		ENV_SETUP PYTHON DATASET WRITERS DATA_NAME COMPONENT_IDS_PER_SERVER SAMPLES T0
 		INTERVAL JOB_LEN BATCH QUERY_ADAPTER QUERY_FILE REPEAT LIMIT_N
-		LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL)
+		LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL DRY_RUN)
 	# Forward each plugin's own settings too, from both backends.
 	for _bc in "${WRITE_BACKEND}" "${QUERY_BACKEND}"; do
 		_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/${_bc}_backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"

@@ -4,12 +4,28 @@
 # query/<name>_query.py. See backends/README.md for what each hook must do.
 # Hooks you do not define are skipped; plugin_write is required.
 #
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets,
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, all_targets,
 # dataset_args (array, in plugin_write), and every setting from bench.conf
 # and <name>_backend.conf.
+#
+# Set DRY_RUN=1 (bin/run.sh's -d flag) to log the command a hook would run
+# instead of running it. Route any plain external command a hook runs
+# (your writer, a compiler, rm/cleanup) through run_logged() -- see
+# plugin_build/plugin_write below -- so a dry run reports it too, the same
+# as the other backends. If your command reads a setting from its own
+# environment rather than from an argv flag (e.g. most writers here read
+# DATASET this way -- see EXTENDING.md's "The value rules"), name it
+# explicitly as "run_logged VAR=val -- CMD ARGS..." (note the literal --)
+# instead of "run_logged CMD ARGS..."; otherwise the logged line only works
+# from inside this script, not copied out and run standalone. See
+# EXTENDING.md, "Supporting bin/run.sh -d (dry run)", for the full rule and
+# for a command that must be backgrounded or exec'd (plugin_serve_start/
+# plugin_serve_run), which can't go through run_logged directly and must
+# self-gate on DRY_RUN -- backends/dsos/dsos_plugin.sh's plugin_serve_start
+# is a worked example.
 
 # plugin_build() {
-# 	: # compile writers, if any
+# 	run_logged make -C "${PLUGIN_DIR}/writer"   # compile writers, if any
 # }
 
 plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
@@ -17,6 +33,12 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	# Replace any existing data for this partition of TARGET, then write
 	# partition INDEX of the data set. Print one JSON summary line; see
 	# backends/README.md.
+	#
+	# Route the actual writer invocation through run_logged so -d reports
+	# it; if your writer reads DATASET (or anything else) from its own
+	# environment rather than a flag, name it explicitly, e.g.:
+	#   run_logged DATASET="${DATASET}" -- "${PYTHON}" "${PLUGIN_DIR}/writer/<name>_write.py" \
+	#       --target "$target" --node-index "$index" "${dataset_args[@]}"
 	die "template backend: plugin_write not implemented (writer ${writer}, target ${target}, partition ${index})"
 }
 
@@ -24,4 +46,4 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 # plugin_serve_run() { :; }     # SERVER_ID; run it in the foreground (Slurm)
 # plugin_serve_stop() { :; }
 # plugin_serve_status() { :; }  # return 0 when the service is ready
-# plugin_clean() { :; }         # SERVER_ID; delete this server's data
+# plugin_clean() { :; }         # SERVER_ID; delete this server's data (run_logged rm ...)

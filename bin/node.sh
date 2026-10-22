@@ -41,6 +41,47 @@ HOST="$(hostname -s)"
 die() { echo "[${HOST}] error: $*" >&2; exit 1; }
 log() { echo "[${HOST}] $*"; }
 
+# Logs a command's argv, then runs it -- unless DRY_RUN is set (bin/run.sh's
+# -d flag forwards it here), in which case it only logs and returns success.
+# Plugins route their actual external commands (writer invocations, build,
+# clean) through this so a dry run and a real run produce the same "+ ..."
+# log line, and only a real run executes it. (A command that must be
+# backgrounded or exec'd, such as a service start, can't go through this
+# directly -- those log their own "+ ..." line and gate on DRY_RUN
+# themselves; see e.g. backends/dsos/dsos_plugin.sh.)
+#
+# A command that reads a setting from its own environment rather than from
+# an argv flag -- every writer does this for DATASET -- needs that setting
+# named explicitly, or the "+ ..." line can't be copied out and run
+# standalone (it would already be set in node.sh's own shell, which is not
+# where you'd paste the line). Give those as leading "VAR=val" arguments
+# followed by "--", and run_logged both logs and (for a real run) exports
+# exactly those vars for CMD: "run_logged DATASET=\"$DATASET\" -- \"$PYTHON\"
+# writer.py ...". With no "--" anywhere in the arguments, every argument is
+# CMD/ARGS as before, so existing calls are unaffected.
+run_logged() { # [VAR=val ...] -- CMD ARGS...
+	local envs=()
+	while [[ $# -gt 0 && "$1" != "--" ]]; do
+		envs+=("$1")
+		shift
+	done
+	if [[ "${1:-}" == "--" ]]; then
+		shift
+	else
+		# No "--" found: there were no env vars, so what was collected into
+		# envs[] above is actually CMD/ARGS -- restore it.
+		set -- "${envs[@]}"
+		envs=()
+	fi
+	log "+ $(printf '%q ' "${envs[@]}")$(printf '%q ' "$@")"
+	[[ -n "${DRY_RUN:-}" ]] && return 0
+	if [[ ${#envs[@]} -gt 0 ]]; then
+		env "${envs[@]}" "$@"
+	else
+		"$@"
+	fi
+}
+
 # Every target the harness writes: one per writer, plus the live-test target.
 all_targets() {
 	local w

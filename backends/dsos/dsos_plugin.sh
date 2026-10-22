@@ -16,8 +16,16 @@
 #   plugin_serve_status                       manage dsosd on this server
 #   plugin_clean ID                           delete containers and run files
 #
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, all_targets,
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, all_targets,
 # dataset_args (array), and every setting from bench.conf and dsos_backend.conf.
+#
+# Set DRY_RUN=1 (bin/run.sh's -d flag) to log the dsosd/writer command this
+# host would run (via run_logged() or an inline "+ ..." log line) without
+# actually starting/stopping dsosd, writing, or deleting anything. The
+# writer reads DATASET from its environment rather than a flag, so it is
+# passed explicitly to run_logged (see bin/node.sh's run_logged doc comment)
+# -- the logged line is then standalone-runnable, not just a record of what
+# ran inside this script.
 
 # RPC program number of the D/SOS service (program SOSDB in sosapi.x).
 SOSDB_PROG=40009862
@@ -50,7 +58,7 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	local path template session
 	path="$(container_path "$id" "$target")"
 	# Start from an empty container so that reruns do not add duplicates.
-	rm -rf "$path"
+	run_logged rm -rf "$path"
 	mkdir -p "$(dirname "$path")" "${RUN_DIR}"
 	# Reuse the sos backend's make_schema.py — the schema is identical.
 	template="${RUN_DIR}/sos-schema-${HOST}.json"
@@ -64,7 +72,7 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	log "writing ${target} (dsos writer, through dsosd on ${HOST}) to ${path}"
 	case "$writer" in
 	dsos)
-		"${PYTHON}" "${DSOS_DIR}/writer/dsos_write.py" "${args[@]}"
+		run_logged DATASET="${DATASET}" -- "${PYTHON}" "${DSOS_DIR}/writer/dsos_write.py" "${args[@]}"
 		;;
 	*)
 		die "the dsos backend has no writer '$writer' (available: dsos)"
@@ -121,6 +129,11 @@ plugin_serve_start() { # SERVER_ID
 		deregister || die "could not remove the stale registration"
 	fi
 	write_directory "$id"
+	log "+ DSOSD_DIRECTORY=$(printf '%q' "${DIRFILE}") DSOSD_SERVER_ID=$(printf '%q' "$id") $(printf '%q ' ${DSOSD})"
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "dry run: dsosd not started; registration not checked"
+		return 0
+	fi
 	log "starting dsosd (server id ${id}, log ${LOGFILE})"
 	DSOSD_DIRECTORY="${DIRFILE}" DSOSD_SERVER_ID="$id" \
 		nohup ${DSOSD} >"${LOGFILE}" 2>&1 </dev/null &
@@ -136,6 +149,11 @@ plugin_serve_start() { # SERVER_ID
 plugin_serve_run() { # SERVER_ID -- foreground, used by the Slurm launcher
 	local id="$1"
 	write_directory "$id"
+	log "+ DSOSD_DIRECTORY=$(printf '%q' "${DIRFILE}") DSOSD_SERVER_ID=$(printf '%q' "$id") $(printf '%q ' ${DSOSD})"
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "dry run: not exec'ing dsosd"
+		return 0
+	fi
 	echo $$ >"${PIDFILE}"
 	log "running dsosd in the foreground (server id ${id})"
 	export DSOSD_DIRECTORY="${DIRFILE}" DSOSD_SERVER_ID="$id"
@@ -143,6 +161,10 @@ plugin_serve_run() { # SERVER_ID -- foreground, used by the Slurm launcher
 }
 
 plugin_serve_stop() {
+	if [[ -n "${DRY_RUN:-}" ]]; then
+		log "+ (dry run) would stop dsosd using ${PIDFILE}"
+		return 0
+	fi
 	if [[ ! -f "${PIDFILE}" ]]; then
 		log "no dsosd pid file; nothing to stop"
 		return 0
@@ -180,12 +202,12 @@ plugin_clean() { # SERVER_ID
 	local id="$1"
 	# Remove containers written by the dsos writer (if any).
 	if [[ -d "${SOS_DATA_ROOT}/${id}" ]]; then
-		rm -rf "${SOS_DATA_ROOT:?}/${id}"
-		log "removed ${SOS_DATA_ROOT}/${id}"
+		run_logged rm -rf "${SOS_DATA_ROOT:?}/${id}"
+		[[ -n "${DRY_RUN:-}" ]] || log "removed ${SOS_DATA_ROOT}/${id}"
 	fi
 	# Remove dsosd run files and session file.
-	rm -f "${PIDFILE}" "${DIRFILE}" "${LOGFILE}"
-	rm -f "${RUN_DIR}/dsos-write-session-${HOST}.txt"
-	rm -f "${RUN_DIR}/sos-schema-${HOST}.json"
-	log "removed dsosd run files on this node"
+	run_logged rm -f "${PIDFILE}" "${DIRFILE}" "${LOGFILE}"
+	run_logged rm -f "${RUN_DIR}/dsos-write-session-${HOST}.txt"
+	run_logged rm -f "${RUN_DIR}/sos-schema-${HOST}.json"
+	[[ -n "${DRY_RUN:-}" ]] || log "removed dsosd run files on this node"
 }
