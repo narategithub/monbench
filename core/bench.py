@@ -315,6 +315,11 @@ def load_query_set(path, adapter):
         sys.exit(f"bench.py: {path} has no 'queries' list")
     values = DS.placeholders(LIMIT_N,
                              _build_literal_formats(adapter.type_overrides))
+    # A second set of placeholders without literal formats, used to expand
+    # the backend-neutral 'match' description. The verifier's condition
+    # parser expects bare numeric values, not the backend-specific wrappers.
+    match_values = DS.placeholders(LIMIT_N)
+
     # Build the column map once so we can apply it to every query template
     # *before* placeholder expansion.  This order matters: literal formats
     # may inject function names that contain a dataset attribute name (e.g.
@@ -335,7 +340,7 @@ def load_query_set(path, adapter):
         if text:
             text = _apply_column_map(text, col_map)
         match = q.get("match")
-        spec, reason = (parse_match(fill(match, values, where)) if match
+        spec, reason = (parse_match(fill(match, match_values, where)) if match
                         else (None, "no 'match' description"))
         if not q.get("verify", True):
             spec, reason = None, "verification off for this query"
