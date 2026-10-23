@@ -66,6 +66,8 @@ For every backend:
 
 - Python 3 on every node, and on the query node the Python client of the
   backend being queried.
+- `libjansson-dev` (Debian/Ubuntu) or `jansson-devel` (RHEL/Fedory) -
+  the JSON C library, used by `dataset.c` and the SOS C writer.
 - The suite directory at the same path on all nodes. On a shared filesystem
   nothing needs copying; otherwise use `bin/run.sh -l ssh deploy`.
 
