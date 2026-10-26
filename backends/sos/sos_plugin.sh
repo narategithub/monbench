@@ -7,12 +7,16 @@
 # with no RPC; see backends/dsos for querying across servers through dsosd.
 #
 # Hooks (see backends/README.md for the contract):
-#   plugin_build                              build the C writer
-#   plugin_write WRITER TARGET MODE INDEX ID  write one partition into a local
-#                                             SOS container named TARGET
-#   plugin_clean ID                           delete this server's containers
+#   plugin_build                          build the C writer
+#   plugin_write WRITER MODE INDEX ID     write one partition into a local
+#                                         SOS container; the plugin constructs
+#                                         the storage name from DS.name and the
+#                                         writer name, and records it in a
+#                                         storage meta file at
+#                                         OUTPUT_DIR/meta/storage-<writer>.json
+#   plugin_clean ID                       delete this server's containers
 #
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, all_targets,
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, ds_name,
 # dataset_args (array), and every setting from bench.conf and sos_backend.conf.
 #
 # Debugging the C writer: set GDB=1 in the environment to launch it under
@@ -47,18 +51,32 @@ plugin_build() {
 
 # ----------------------------------------------------------------- write
 
-plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
-	local writer="$1" target="$2" index="$4" id="$5"
+plugin_write() { # WRITER MODE INDEX SERVER_ID
+	local writer="$1" mode="$2" index="$3" id="$4"
+	# Construct the storage name from the dataset definition's name field
+	# and the writer name. Live mode uses a separate target so it does not
+	# overwrite the full data set.
+	local ds target
+	ds="$(ds_name)"
+	if [[ "$mode" == "live" ]]; then
+		target="${ds}_live"
+	else
+		target="${ds}_${writer}"
+	fi
 	local path template
 	path="$(container_path "$id" "$target")"
 	# Start from an empty container so that reruns do not add duplicates.
 	run_logged rm -rf "$path"
-	mkdir -p "$(dirname "$path")" "${RUN_DIR}"
-	template="${RUN_DIR}/sos-schema-${HOST}.json"
+	mkdir -p "$(dirname "$path")" "${OUTPUT_DIR}/meta"
+	# The schema template is backend-level metadata (shared across nodes),
+	# so it lives in OUTPUT_DIR/meta/.
+	template="${OUTPUT_DIR}/meta/sos-schema.json"
 	"${PYTHON}" "${SOS_DIR}/make_schema.py" "${DATASET}" "$template"
 	local args=(--path "$path" --template "$template" --node-index "$index"
 		"${dataset_args[@]}" --storage "${SOS_STORAGE}")
 	log "writing ${target} (${writer} writer, SOS ${SOS_STORAGE}) to ${path}"
+	# Record where we stored data so the query side can find it.
+	_sos_write_meta "$writer" "$target" "$id"
 	case "$writer" in
 	c)
 		[[ -x "${SOS_DIR}/writer/sos_write" ]] ||
@@ -84,14 +102,31 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	esac
 }
 
+# Write a storage meta file recording where the writer stored data, so the
+# query side can find it without reconstructing paths by convention.
+# See EXTENDING.md, "Plugin meta files".
+_sos_write_meta() { # WRITER TARGET SERVER_ID
+	local writer="$1" target="$2" id="$3"
+	local meta_dir="${OUTPUT_DIR}/meta"
+	mkdir -p "$meta_dir"
+	cat >"${meta_dir}/storage-${writer}.json" <<-EOF
+	{
+	  "target": "${target}",
+	  "backend": "sos",
+	  "data_root": "${SOS_DATA_ROOT}",
+	  "container_path": "$(container_path "$id" "$target")"
+	}
+	EOF
+}
+
 # ----------------------------------------------------------------- clean
 
 # Delete this server's containers. Kept separate so that dsos can reuse it
 # after removing its own service files.
 sos_clean_data() { # SERVER_ID
 	run_logged rm -rf "${SOS_DATA_ROOT:?}/$1"
-	run_logged rm -f "${RUN_DIR}/sos-schema-${HOST}.json"
-	[[ -n "${DRY_RUN:-}" ]] || log "removed ${SOS_DATA_ROOT}/$1 and this node's schema file"
+	run_logged rm -f "${OUTPUT_DIR}/meta/sos-schema.json"
+	[[ -n "${DRY_RUN:-}" ]] || log "removed ${SOS_DATA_ROOT}/$1 and the schema file"
 }
 
 plugin_clean() { # SERVER_ID

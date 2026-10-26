@@ -14,10 +14,16 @@ the query set runs one or both of the following steps:
   query  Run the query REPEAT times, timing each run from the start of the
          query until the last row has been fetched.
 
-The data set parameters come from the target's metadata file, written when
-the target was written. If it names a different backend, the run stops.
+The data set parameters come from the writer's metadata file, written when
+the data was written. If it names a different backend, the run stops.
 
-'--live' polls a target that is still being written and checks that every
+The storage target (container name, measurement, etc.) is determined by
+reading the backend plugin's storage meta file at
+OUTPUT_DIR/meta/storage-<writer>.json, written by the plugin during the
+write phase. This is the writer->query handoff: the plugin decides where
+to store the data, records it, and the query engine reads it back.
+
+'--live' polls a writer that is still writing and checks that every
 answer is internally consistent and that the row count never decreases.
 
 Set DRY_RUN=1 in the environment (bin/run.sh's -d flag forwards it here, the
@@ -57,8 +63,7 @@ WRITE_BACKEND = os.environ.get("WRITE_BACKEND", BACKEND)
 # Backends whose data this query backend can read (from its <name>_backend.conf).
 PLUGIN_READS = os.environ.get("PLUGIN_READS", "").split()
 SERVERS = env("SERVER_HOSTS").split()
-RUN_DIR = env("RUN_DIR")
-RESULTS_DIR = env("RESULTS_DIR")
+OUTPUT_DIR = env("OUTPUT_DIR")
 LIMIT_N = env("LIMIT_N", int)
 LIVE_POLL = env("LIVE_POLL", float)
 REPEAT = env("REPEAT", int, "5")
@@ -86,12 +91,50 @@ def load_plugin():
     return module.ADAPTERS[name]
 
 
-def make_adapter(cls, target):
+# ----------------------------------------------------------------- plugin meta
+
+
+def _read_plugin_meta(writer):
+    """Read the backend plugin's storage meta from OUTPUT_DIR/meta/storage-<writer>.json.
+
+    The plugin writes this during the write phase to record where and how
+    it stored the data (the target name, paths, database names, etc.).
+    Returns None if the file does not exist (e.g. live mode before writing
+    finishes).
+    """
+    path = os.path.join(OUTPUT_DIR, "meta", f"storage-{writer}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _resolve_target(writer, plugin_meta, live=False):
+    """Determine the storage target name from the plugin meta file.
+
+    The plugin records its chosen target in the meta file during the write
+    phase. For live mode (writer still running), the meta may not exist
+    yet; fall back to the convention '<ds_name>_live'.
+    """
+    if plugin_meta and "target" in plugin_meta:
+        return plugin_meta["target"]
+    # InfluxDB uses "measurement" instead of "target".
+    if plugin_meta and "measurement" in plugin_meta:
+        return plugin_meta["measurement"]
+    # Fallback: derive from convention (needed for live mode).
+    if live:
+        return f"{DS.name}_live"
+    return f"{DS.name}_{writer}"
+
+
+def make_adapter(cls, writer, live=False):
+    plugin_meta = _read_plugin_meta(writer)
+    target = _resolve_target(writer, plugin_meta, live=live)
     inst = cls({"target": target, "schema": DS.name, "servers": SERVERS,
-                "run_dir": RUN_DIR, "env": os.environ})
+                "output_dir": OUTPUT_DIR, "env": os.environ})
     inst._column_map = _build_column_map(
         cls.type_overrides, DS.definition.get("attributes", []))
-    return inst
+    return inst, target
 
 # ----------------------------------------------------------------- row checks
 
@@ -432,8 +475,8 @@ class Tee:
 
 
 class Report:
-    def __init__(self, target, adapter):
-        self.target = target
+    def __init__(self, writer, adapter):
+        self.writer = writer
         self.adapter = adapter
         self.items = []
         self.width = 40
@@ -599,14 +642,14 @@ def run_query_set(rep, adapter, queries, mode="both"):
         rep.add(label, status, detail, **fields)
 
 
-def load_dataset(target, live):
-    """Data set to verify against: from the target's metadata if present."""
+def load_dataset(writer, live):
+    """Data set to verify against: from the writer's metadata if present."""
     global DS
-    meta = None if live else read_meta(target)
+    meta = None if live else read_meta(writer)
     if meta:
         wrote = meta["backend"]
         if PLUGIN_READS and wrote not in PLUGIN_READS:
-            sys.exit(f"bench.py: target '{target}' was written by backend "
+            sys.exit(f"bench.py: writer '{writer}' was written by backend "
                      f"'{wrote}', which query backend '{QUERY_BACKEND}' cannot "
                      f"read (it reads: {', '.join(PLUGIN_READS)})")
         DS = Dataset.from_meta(meta)
@@ -615,14 +658,14 @@ def load_dataset(target, live):
     return "no metadata file; using the current settings" if not live else "live settings"
 
 
-def load_ingest_results(target):
-    """Read the write result files for TARGET and return structured data."""
+def load_ingest_results(writer):
+    """Read the write result files for WRITER and return structured data."""
     import glob
-    pattern = os.path.join(RESULTS_DIR, f"write-{target}-*.json")
+    pattern = os.path.join(OUTPUT_DIR, "results", f"write-{writer}-*.json")
     files = sorted(glob.glob(pattern))
     hosts = []
     for f in files:
-        host = os.path.basename(f).replace(f"write-{target}-", "").replace(".json", "")
+        host = os.path.basename(f).replace(f"write-{writer}-", "").replace(".json", "")
         try:
             with open(f) as fh:
                 d = json.load(fh)
@@ -682,14 +725,15 @@ def print_ingest_summary(ingest):
               f"  {sm.get('aggregate_records_per_s','-'):>10}")
 
 
-def run_checks(target, query_file, mode="both"):
+def run_checks(writer, query_file, mode="both"):
     cls = load_plugin()
-    source = load_dataset(target, live=False)
-    adapter = make_adapter(cls, target)
+    source = load_dataset(writer, live=False)
+    adapter, target = make_adapter(cls, writer)
     print(f"Write backend '{WRITE_BACKEND}' -> query backend '{QUERY_BACKEND}' "
-          f"(adapter '{adapter.name}'), target '{target}' on {', '.join(SERVERS)}")
+          f"(adapter '{adapter.name}'), writer '{writer}', target '{target}' "
+          f"on {', '.join(SERVERS)}")
     print(f"Data set '{DS.name}': {DS.size()} records in {DS.partitions} partitions; {source}")
-    ingest = load_ingest_results(target)
+    ingest = load_ingest_results(writer)
     if DRY_RUN:
         print("\nDRY RUN: not connecting to the backend; queries below are resolved but not sent.")
     else:
@@ -705,8 +749,9 @@ def run_checks(target, query_file, mode="both"):
     print(f"\nQuery benchmark  [adapter: {adapter.name}, mode: {mode}]")
     print(f"  {query_file} — {len(queries)} queries, {mode_desc[mode]}")
 
-    rep = Report(target, adapter.name)
+    rep = Report(writer, adapter.name)
     rep.ingest = ingest
+    rep.target = target
     try:
         run_query_set(rep, adapter, queries, mode=mode)
     finally:
@@ -715,21 +760,23 @@ def run_checks(target, query_file, mode="both"):
     return rep
 
 
-def run_write_summary(target):
-    """Load and print the ingest summary for a target after writing."""
-    source = load_dataset(target, live=False)
+def run_write_summary(writer):
+    """Load and print the ingest summary for a writer after writing."""
+    source = load_dataset(writer, live=False)
     print(f"Data set '{DS.name}': {DS.size()} records in {DS.partitions} partitions; {source}")
-    ingest = load_ingest_results(target)
+    ingest = load_ingest_results(writer)
     print("\nIngest performance:")
     print_ingest_summary(ingest)
     return ingest
 
 
-def run_live(target):
-    """Poll a target that is being written; each answer must be valid."""
+def run_live(writer):
+    """Poll a writer that is being written; each answer must be valid."""
     cls = load_plugin()
-    load_dataset(target, live=True)
-    rep = Report(target, cls.name)
+    load_dataset(writer, live=True)
+    adapter, target = make_adapter(cls, writer, live=True)
+    rep = Report(writer, adapter.name)
+    rep.target = target
     final = DS.size()
     # The poll uses the query set's first query of type "all", so that the
     # live test needs no backend-specific query of its own.
@@ -738,19 +785,20 @@ def run_live(target):
     if not text:
         sys.exit(f"bench.py: {QUERY_FILE} has no query of type 'all' for adapter '{cls.name}'")
     if DRY_RUN:
-        print(f"DRY RUN: would poll '{target}' every {LIVE_POLL}s until {final} rows with:")
+        print(f"DRY RUN: would poll writer '{writer}' (target '{target}') every "
+              f"{LIVE_POLL}s until {final} rows with:")
         print(f"    {text}")
         rep.add("live poll", "DRY", "not run (dry run)")
         return rep
     # Column names and literal formats were already applied in load_query_set.
-    print(f"Polling '{target}' every {LIVE_POLL}s until {final} rows")
+    print(f"Polling writer '{writer}' (target '{target}') every {LIVE_POLL}s until {final} rows")
     counts, invalid, errors = [], 0, 0
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
-        adapter = make_adapter(cls, target)
+        live_adapter, _ = make_adapter(cls, writer, live=True)
         try:
-            adapter.connect()
-            _, rows = collect(adapter, text)
+            live_adapter.connect()
+            _, rows = collect(live_adapter, text)
         except Exception as e:  # e.g. the target does not exist yet
             errors += 1
             print(f"    poll: error ({e})")
@@ -763,7 +811,7 @@ def run_live(target):
             if len(rows) >= final:
                 break
         finally:
-            adapter.close()
+            live_adapter.close()
         time.sleep(LIVE_POLL)
     monotonic = is_sorted(counts)
     complete = bool(counts) and counts[-1] == final
@@ -782,32 +830,35 @@ def run_live(target):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--target", required=True,
-                   help="name of the written data (container, database, ...)")
+    p.add_argument("--writer", required=True,
+                   help="name of the writer whose data to check or benchmark")
     p.add_argument("--mode", choices=("check", "query", "both", "write-summary"),
                    default="both",
                    help="check = verify only (no timing); "
                         "query = time only (no verification); "
                         "both = verify then time (default); "
-                        "write-summary = print ingest summary for a target")
+                        "write-summary = print ingest summary for a writer")
     p.add_argument("--live", action="store_true")
     p.add_argument("--queries", default=QUERY_FILE,
                    help="query set file (default: QUERY_FILE, or queries/default.json)")
     a = p.parse_args()
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    results_dir = os.path.join(OUTPUT_DIR, "results")
+    os.makedirs(results_dir, exist_ok=True)
 
     if a.mode == "write-summary":
-        run_write_summary(a.target)
+        run_write_summary(a.writer)
         return 0
 
     suffix = "-live" if a.live else f"-{QUERY_ADAPTER or 'default'}"
-    log_path = os.path.join(RESULTS_DIR, f"benchmark-{a.target}{suffix}.log")
+    log_path = os.path.join(OUTPUT_DIR, "logs", f"benchmark-{a.writer}{suffix}.log")
     tee = Tee(log_path)
     try:
-        rep = run_live(a.target) if a.live else run_checks(a.target, a.queries, mode=a.mode)
+        rep = run_live(a.writer) if a.live else run_checks(a.writer, a.queries, mode=a.mode)
     finally:
         tee.close()
+
+    target = getattr(rep, "target", a.writer)
 
     # Build a generic benchmark result: same structure regardless of backend.
     query_results = []
@@ -829,7 +880,8 @@ def main():
         query_results.append(entry)
 
     result = {
-        "target": a.target,
+        "writer": a.writer,
+        "target": target,
         "dataset": DS.params(),
         "servers": SERVERS,
         "dry_run": DRY_RUN,
@@ -849,7 +901,7 @@ def main():
         "all_passed": not rep.failed(),
     }
 
-    out = os.path.join(RESULTS_DIR, f"benchmark-{a.target}{suffix}.json")
+    out = os.path.join(results_dir, f"benchmark-{a.writer}{suffix}.json")
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"  results: {out}")

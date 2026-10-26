@@ -52,9 +52,14 @@ def _dedup_list_rows(ctx, text, columns, rows):
 
 
 def _session_file(ctx):
-    """DSOS session file: the server hosts, one per line."""
-    os.makedirs(ctx["run_dir"], exist_ok=True)
-    path = os.path.join(ctx["run_dir"], "dsos-session.txt")
+    """DSOS session file: the server hosts, one per line.
+
+    Written to output_dir/tmp/ -- a transient runtime file, not part of
+    the writer→query meta handoff.
+    """
+    tmp_dir = os.path.join(ctx["output_dir"], "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    path = os.path.join(tmp_dir, "dsos-session.txt")
     with open(path, "w") as f:
         f.write("\n".join(ctx["servers"]) + "\n")
     return path

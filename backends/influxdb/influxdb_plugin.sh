@@ -1,23 +1,27 @@
 # influxdb_plugin.sh -- InfluxDB v3 Core hooks, sourced by bin/node.sh when BACKEND=influxdb.
 #
 # Hooks (see backends/README.md for the contract):
-#   plugin_write       WRITER TARGET MODE INDEX ID  write one partition
-#   plugin_serve_start ID                           on the designated server host only;
-#                                                   generate a token (offline),
-#                                                   start influxdb3, create the
-#                                                   database
-#   plugin_serve_run   ID                           foreground influxdb3
-#                                                   (slurm launcher)
-#                                                   sane designated-host-only rule
-#   plugin_serve_stop                               stop influxdb3 (no-op
-#                                                   where nothing was started)
-#   plugin_clean       ID                           remove data directory and
-#                                                   generated token file
-#                                                   (no-op where neither exists)
+#   plugin_write       WRITER MODE INDEX ID   write one partition; the plugin
+#                                             uses DS.name as the measurement
+#                                             name and records it in a storage
+#                                             meta file at
+#                                             OUTPUT_DIR/meta/storage-<writer>.json
+#   plugin_serve_start ID                     on the designated server host only;
+#                                             generate a token (offline),
+#                                             start influxdb3, create the
+#                                             database
+#   plugin_serve_run   ID                     foreground influxdb3
+#                                             (slurm launcher)
+#                                             sane designated-host-only rule
+#   plugin_serve_stop                         stop influxdb3 (no-op
+#                                             where nothing was started)
+#   plugin_clean       ID                     remove data directory and
+#                                             generated token file
+#                                             (no-op where neither exists)
 #
 # No build step (the writer is Python).
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, dataset_args
-# (array), and every setting from bench.conf and influxdb_backend.conf.
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, ds_name,
+# dataset_args (array), and every setting from bench.conf and influxdb_backend.conf.
 #
 # Set DRY_RUN=1 (bin/run.sh's -d flag) to log the write/serve command this
 # host would run (via run_logged() or an inline "+ ..." log line) without
@@ -39,10 +43,10 @@
 
 INFLUX_DIR="${BENCH_DIR}/backends/influxdb"
 
-# All runtime files live under RUN_DIR so the harness owns the full lifecycle
-# and clean wipes everything in one place.
-_INFLUX_PID="${RUN_DIR}/influxdb3.pid"
-_INFLUX_LOG="${RUN_DIR}/influxdb3.log"
+# PID file under the designated host's nodes/<hostname>/run/.
+_INFLUX_PID="${OUTPUT_DIR}/nodes/${HOST}/run/influxdb3.pid"
+# Daemon log goes to the shared logs/ directory.
+_INFLUX_LOG="${OUTPUT_DIR}/logs/influxdb3-${HOST}.log"
 
 # The designated InfluxDB host: extracted from the INFLUX_HOST URL. Only
 # this hostname runs influxdb3; every other SERVER_HOSTS entry is a remote
@@ -58,14 +62,16 @@ _influx_is_server_host() {
 
 # ----------------------------------------------------------------- write
 
-plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
+plugin_write() { # WRITER MODE INDEX SERVER_ID
 	log "token file: ${INFLUX_TOKEN_FILE}"
-	local writer="$1" index="$4"
-	# $2 (target) is part of the plugin_write contract but unused here: the
-	# measurement name is DATA_NAME, not the per-writer target string, so
-	# every backend's query strings can address it with {schema} uniformly.
+	local writer="$1" mode="$2" index="$3"
 	[[ "$writer" == "influx" ]] ||
 		die "the influxdb backend has no writer '$writer' (available: influx)"
+
+	# The measurement name comes from the dataset definition's name field
+	# (DS.name), the single source of truth for the logical data name.
+	local measurement
+	measurement="$(ds_name)"
 
 	# dataset_args carries a generic --batch sized for SOS transactions.
 	# InfluxDB's write batch is INFLUX_WRITE_BATCH, so drop --batch and its
@@ -80,16 +86,36 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	local token="<token>"
 	[[ -n "${DRY_RUN:-}" ]] || token="$(_influx_read_token)"
 
-	log "writing ${DATA_NAME} to ${INFLUX_DATABASE} (influx writer, ${INFLUX_INTERFACE} interface) on ${INFLUX_HOST}"
+	log "writing ${measurement} to ${INFLUX_DATABASE} (influx writer, ${INFLUX_INTERFACE} interface) on ${INFLUX_HOST}"
+	# Record where we stored data so the query side can find it.
+	_influx_write_meta "$writer" "$measurement"
 	run_logged DATASET="${DATASET}" -- \
 		"${PYTHON}" "${INFLUX_DIR}/writer/influx_write.py" \
-		--measurement "$DATA_NAME" --node-index "$index" \
+		--measurement "$measurement" --node-index "$index" \
 		"${args[@]}" --batch "${INFLUX_WRITE_BATCH}" \
 		--interface "${INFLUX_INTERFACE}" \
 		--host "${INFLUX_HOST}" \
 		--database "${INFLUX_DATABASE}" \
 		--precision "${INFLUX_PRECISION}" \
 		--token "$token"
+}
+
+# Write a storage meta file recording what measurement the writer used, so
+# the query side can find it without reconstructing the name by convention.
+# See EXTENDING.md, "Plugin meta files".
+_influx_write_meta() { # WRITER MEASUREMENT
+	local writer="$1" measurement="$2"
+	local meta_dir="${OUTPUT_DIR}/meta"
+	mkdir -p "$meta_dir"
+	cat >"${meta_dir}/storage-${writer}.json" <<-EOF
+	{
+	  "target": "${measurement}",
+	  "backend": "influxdb",
+	  "measurement": "${measurement}",
+	  "database": "${INFLUX_DATABASE}",
+	  "host": "${INFLUX_HOST}"
+	}
+	EOF
 }
 
 # ----------------------------------------------------------------- helpers
@@ -110,7 +136,7 @@ plugin_serve_start() { # SERVER_ID
 		return 0
 	fi
 
-	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
+	mkdir -p "${INFLUX_DATA_DIR}" "${OUTPUT_DIR}/nodes/${HOST}/run" "${OUTPUT_DIR}/logs"
 
 	log "+ influxdb3 serve --node-id ${HOST} --object-store file --data-dir ${INFLUX_DATA_DIR} --admin-token-file ${INFLUX_TOKEN_FILE}"
 	if [[ -n "${DRY_RUN:-}" ]]; then
@@ -176,7 +202,7 @@ plugin_serve_run() { # SERVER_ID  (foreground; used by the slurm launcher)
 
 	# The token file must already exist (serve_start ran first in the slurm
 	# flow before serve_run is called for background operation).
-	mkdir -p "${INFLUX_DATA_DIR}" "${RUN_DIR}"
+	mkdir -p "${INFLUX_DATA_DIR}" "${OUTPUT_DIR}/nodes/${HOST}/run" "${OUTPUT_DIR}/logs"
 	log "+ influxdb3 serve --node-id ${HOST} --object-store file --data-dir ${INFLUX_DATA_DIR} --admin-token-file ${INFLUX_TOKEN_FILE}"
 	if [[ -n "${DRY_RUN:-}" ]]; then
 		log "dry run: not exec'ing influxdb3"

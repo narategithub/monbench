@@ -66,8 +66,6 @@ For every backend:
 
 - Python 3 on every node, and on the query node the Python client of the
   backend being queried.
-- `libjansson-dev` (Debian/Ubuntu) or `jansson-devel` (RHEL/Fedory) -
-  the JSON C library, used by `dataset.c` and the SOS C writer.
 - The suite directory at the same path on all nodes. On a shared filesystem
   nothing needs copying; otherwise use `bin/run.sh -l ssh deploy`.
 
@@ -109,16 +107,39 @@ meant to be queried by: `timestamp`, `comp_time` (component_id, timestamp)
 and `job_comp_time` (job_id, component_id, timestamp). Each backend maps the
 keys onto its own indexing; the SOS plugin creates an index for each.
 
-Each writer writes its own **target** (a container, database or bucket),
-`<DATA_NAME>_<writer>`, so writers can be compared. A rerun of `write`
-replaces the target's data. After each target is written, the harness
-records its backend, writer and data-set parameters in
-`results/meta/<target>.json`. The query engine verifies against those
-parameters, so a later change to `SAMPLES` does not invalidate a check of
-data written earlier.
+### Naming and storage
+
+The dataset definition's `"name"` field (`DS.name`) is the single source of
+truth for the logical data name (e.g. `"monitoring_nested"`). The core
+never constructs storage target names — that is the plugin's job. Each
+backend plugin constructs its own storage name (a container path, a
+measurement, a database) during the write phase and records it in a **plugin
+meta file** at `OUTPUT_DIR/meta/storage-<writer>.json`. The query engine
+reads that meta file to find where the data was stored.
+
+After each writer finishes, the harness also records dataset parameters in a
+separate **core meta file** at `OUTPUT_DIR/meta/dataset-<writer>.json`. The
+query engine verifies against those parameters, so a later change to `SAMPLES`
+does not invalidate a check of data written earlier.
 
 The default data set is a fixed monitoring shape. To define a different
 shape, see the "Defining a custom dataset" section in `EXTENDING.md`.
+
+### OUTPUT_DIR layout
+
+Each backend pair gets its own `OUTPUT_DIR/<pair>/` with a well-defined
+subdirectory layout:
+
+| Subdirectory | Purpose |
+|---|---|
+| `meta/` | Writer→query handoff: each plugin writes `storage-<writer>.json` here during the write phase; the query engine reads it to find where the data was stored |
+| `nodes/<hostname>/data/` | Backend storage (containers, databases) |
+| `nodes/<hostname>/run/` | Runtime files: daemon PIDs, tokens |
+| `nodes/<hostname>/tmp/` | Transient files: schema templates, session files |
+| `results/` | Benchmark statistics (user-facing output) |
+| `logs/` | All logs (step, daemon, benchmark) |
+
+The `clean` phase removes the per-node trees under `OUTPUT_DIR/<pair>/nodes/`.
 
 ## How monbench works
 
@@ -134,11 +155,11 @@ through one of three **launchers**: `ssh`, `slurm`, or `manual`.
 | `deploy` | Copy the suite directory to every node (ssh only; unnecessary on a shared filesystem) | from the driver node |
 | `build` | Compile the backend's writers, if any need compiling | each server node |
 | `serve-write` | Start the write backend's service on the servers, if it has one (`PLUGIN_SERVICE=1`). Skipped when the backend needs no service | each server node |
-| `write` | Write the data set: each server writes its own partition, once per writer in `WRITERS`. After all servers finish a target, the harness records a metadata file | each server node (parallel) |
+| `write` | Write the data set: each server writes its own partition, once per writer in `WRITERS`. After all servers finish, the harness records a metadata file | each server node (parallel) |
 | `serve-query` | Start the query backend's service, if it differs from the write backend. Skipped when they are the same or the query backend needs no service | each server node |
 | `check` | Run each query once, untimed, and verify the full result against the data set. No timing is recorded | query node |
 | `query` | Run each query `REPEAT` times and time each run. No verification is performed. Reports median, p95 and minimum | query node |
-| `live` | Write a target at a controlled rate while the query node polls it, checking that every answer is valid and the row count never decreases | servers + query node |
+| `live` | Write at a controlled rate while the query node polls it, checking that every answer is valid and the row count never decreases | servers + query node |
 | `stop` | Stop both backend services | each server node |
 | `clean` | Stop both services and delete the servers' data and run files | each server node |
 
@@ -192,7 +213,7 @@ Every launcher, not only `manual`, now prints the exact node-side command a
 step is about to run — `env VAR=val ... bash bin/node.sh ACTION ARGS...`,
 with every setting (`CONFIG_VARS`/`PLUGIN_VARS`) it needs already in that
 `env` prefix — before running it, and writes that same line to the step's
-log file under `results/<pair>/logs/`. It is self-contained: copy it onto
+log file under `OUTPUT_DIR/<pair>/logs/`. It is self-contained: copy it onto
 the named host and it reproduces exactly what the harness ran, with or
 without `-d` (e.g. to attach a debugger or rerun one step by hand).
 
@@ -259,10 +280,10 @@ structure.
 
 ### The live test
 
-`live` writes a new target at `LIVE_RATE` records per second per server
-while the query node polls it with the query set's first query of type
-`all`. It passes when every answer contains only valid, non-duplicated
-records, the row count never decreases, and the final count is reached.
+`live` writes at `LIVE_RATE` records per second per server while the query
+node polls it with the query set's first query of type `all`. It passes
+when every answer contains only valid, non-duplicated records, the row count
+never decreases, and the final count is reached.
 
 ## Quick start
 
@@ -317,27 +338,27 @@ Every other setting in `bench.conf` — `DATASET`, `QUERY_FILE`, `SAMPLES`,
 `REPEAT`, and so on — is shared by every pair, so all backends are measured
 against exactly the same data and the same questions.
 
-Both `RUN_DIR` and `RESULTS_DIR` gain a subdirectory named after the pair
-(`sos-dsos`, `influxdb`, derived from the backend names themselves). That
-name is fixed once per pair (before any of its phases run) and reused by
-every phase in it — build, write, check, query, and so on — regardless of
-which single backend, write or query, is actually doing the work for a
-given phase. That is what keeps a pair's write and query sides agreeing on
-where the data is: for `sos:dsos`, the write phase (handled by `sos`) and
-the check/query phases (handled by `dsos`, reading the very same on-disk
-containers `sos` wrote) both resolve `RUN_DIR` from the one fixed
-`sos-dsos` pair name, rather than from whichever single backend happens to
-be running that particular phase — keying it by whichever backend is
-active for a given phase (`sos` while writing, `dsos` while querying) is
-what causes them to disagree. The same per-pair namespacing on
-`RESULTS_DIR` (and its `logs/` subdirectory) is also what keeps e.g.
-`sos→sos` and `sos→dsos` results apart, since those legitimately differ
-even when the data underneath is identical.
+`OUTPUT_DIR` gains a subdirectory named after the pair (`sos-dsos`,
+`influxdb`, derived from the backend names themselves). That name is fixed
+once per pair (before any of its phases run) and reused by every phase in
+it — build, write, check, query, and so on — regardless of which single
+backend, write or query, is actually doing the work for a given phase. That
+is what keeps a pair's write and query sides agreeing on where the data is:
+for `sos:dsos`, the write phase (handled by `sos`) and the check/query
+phases (handled by `dsos`, reading the very same on-disk containers `sos`
+wrote) both resolve `OUTPUT_DIR` from the one fixed `sos-dsos` pair name,
+rather than from whichever single backend happens to be running that
+particular phase — keying it by whichever backend is active for a given
+phase (`sos` while writing, `dsos` while querying) is what causes them to
+disagree. The same per-pair namespacing on `OUTPUT_DIR` (and its `logs/`
+subdirectory) is also what keeps e.g. `sos→sos` and `sos→dsos` results
+apart, since those legitimately differ even when the data underneath is
+identical.
 
-Because `RUN_DIR` is namespaced per pair, each pair writes its own copy of
-the data, even when two pairs share a writer (e.g. comparing `sos→sos`
+Because `OUTPUT_DIR` is namespaced per pair, each pair writes its own copy
+of the data, even when two pairs share a writer (e.g. comparing `sos→sos`
 against `sos→dsos`): give each pair its own `write` (or `all`) to populate
-its own `RUN_DIR` — the second pair does not inherit the first's data.
+its own `OUTPUT_DIR` — the second pair does not inherit the first's data.
 
 This only works when every pair can share one `SERVER_HOSTS`/`QUERY_HOST`/
 `ENV_SETUP`. If you need different hosts, or environment setup that
@@ -351,8 +372,8 @@ bin/run.sh -c bench-influxdb.conf -l ssh all
 ```
 
 Each file sets its own `BACKENDS` (or `WRITE_BACKEND`/`QUERY_BACKEND`),
-`SERVER_HOSTS`, `QUERY_HOST`, `RUN_DIR` and any backend-specific settings,
-and its own `RESULTS_DIR`.
+`SERVER_HOSTS`, `QUERY_HOST`, `OUTPUT_DIR` and any backend-specific
+settings.
 
 ## Query sets
 
@@ -401,15 +422,16 @@ own query file.
 
 ## Output
 
-- `results/write-<target>-<host>.json`: one JSON object per writer run,
+- `results/write-<writer>-<host>.json`: one JSON object per writer run,
   including records written, time to write, time for the final sync, and
   records per second.
-- `results/meta/<target>.json`: what was written to each target.
-- `results/benchmark-<target>-<adapter>.json`: each query with its
+- `results/meta/dataset-<writer>.json`: what was written by each writer (the
+  data set parameters and writer identity).
+- `results/benchmark-<writer>-<adapter>.json`: each query with its
   expanded query string, status, row count, every timed run, median, p95,
   minimum and rows per second.
-- `results/benchmark-<target>-live.json`: live-poll result.
-- `results/logs/`: the full output of every remote step.
+- `results/benchmark-<writer>-live.json`: live-poll result.
+- `logs/`: the full output of every remote step.
 
 See `OUTPUT.md` for the full JSON structure, what each field means, and
 exactly what the write and query timing measurements cover.

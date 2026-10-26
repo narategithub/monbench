@@ -29,23 +29,23 @@ The harness runs phases in a fixed order. Each phase calls specific plugin hooks
 1. **`clean`** — `plugin_clean`: delete previous data (optional, only when requested)
 2. **`build`** — `plugin_build`: compile writers if needed
 3. **`serve-write`** — `plugin_serve_start`: start the database service (only if `PLUGIN_SERVICE=1`)
-4. **`write`** — `plugin_write`: write each partition of the dataset, one call per server
-5. **`meta`** — the harness records what was written to `results/meta/<target>.json`; no plugin hook
+4. **`write`** — `plugin_write`: write each partition of the dataset, one call per server. The plugin also writes a storage meta file recording where it stored the data (see "Plugin meta files" below)
+5. **`meta`** — the harness records dataset parameters to `meta/dataset-<writer>.json`; no plugin hook
 6. **`serve-query`** — `plugin_serve_start` on the query backend (skipped if it is the same as the write backend)
-7. **`query`** — the engine connects the adapter (`connect()`), loads the query set, and runs each query through `query()` / `count()` / `records()`
+7. **`query`** — the engine reads the plugin's storage meta file from `meta/storage-<writer>.json` to find the storage target, connects the adapter (`connect()`), loads the query set, and runs each query through `query()` / `count()` / `records()`
 8. **`stop`** — `plugin_serve_stop`: stop the service
 
 A backend that manages its own service externally (`PLUGIN_SERVICE=0`) simply skips the serve and stop phases — the harness calls `plugin_write` and the query adapter directly.
 
 ### The config: `<n>_backend.conf`
 
-Sourced after `bench.conf`, so it can use core settings such as `RUN_DIR`. Use the `VAR="${VAR:-default}"` form so every value can be overridden from the environment. These declarations are read by the core:
+Sourced after `bench.conf`, so it can use core settings such as `OUTPUT_DIR`. Use the `VAR="${VAR:-default}"` form so every value can be overridden from the environment. These declarations are read by the core:
 
 | Declaration | Purpose |
 | --- | --- |
 | `DEFAULT_WRITERS` | Writer names used when `WRITERS` is empty in `bench.conf`, e.g. `"py"` |
 | `PLUGIN_SERVICE` | `1` if the harness must start and stop a service (the `serve-write`/`serve-query` and `stop` phases); `0` if the service is managed externally |
-| `PLUGIN_READS` | Space-separated list of backends whose written data this backend can query (e.g. `"sos dsos"`). The harness checks this against the target's metadata file and rejects incompatible write→query pairs before any query runs. Omit or leave empty if not applicable |
+| `PLUGIN_READS` | Space-separated list of backends whose written data this backend can query (e.g. `"sos dsos"`). The harness checks this against the writer's storage meta file and rejects incompatible write→query pairs before any query runs. Omit or leave empty if not applicable |
 | `PLUGIN_DESC` | Short description of what this backend does, shown in the benchmark output |
 | `PLUGIN_VARS` | Space-separated list of this backend's own settings, so they are forwarded to remote nodes |
 
@@ -58,7 +58,7 @@ Sourced by `bin/node.sh` on the node where a step runs. It defines shell functio
 | Hook | Signature | Purpose |
 | --- | --- | --- |
 | `plugin_build` | (none) | Compile writers if needed |
-| `plugin_write` | `WRITER TARGET MODE INDEX SERVER_ID` | Write partition `INDEX` of the dataset, print one JSON summary line |
+| `plugin_write` | `WRITER MODE INDEX SERVER_ID` | Write partition `INDEX` of the dataset, print one JSON summary line. The plugin constructs its own storage target name (see "Plugin meta files" below) |
 | `plugin_serve_start` | `SERVER_ID` | Start the database service in the background |
 | `plugin_serve_run` | `SERVER_ID` | Run the service in the foreground (Slurm launcher) |
 | `plugin_serve_stop` | (none) | Stop the service |
@@ -67,7 +67,7 @@ Sourced by `bin/node.sh` on the node where a step runs. It defines shell functio
 
 The `plugin_write` hook receives `dataset_args`, an array with the flags every writer should accept: `--components N --samples N --t0 SECS --interval SECS --job-len N --batch N --rate RECS_PER_SEC`. Your writer must produce records that match the value rules in `core/dataset.py` exactly — the query engine verifies every answer against them.
 
-The `plugin_write` arguments in order: `$1` = WRITER (the writer name), `$2` = TARGET (the data name, e.g. `monitoring_influx`), `$3` = MODE (`full` or `live`), `$4` = INDEX (the partition index, 0-based), `$5` = SERVER\_ID. Most backends use `$1`, `$2`, and `$4`; MODE is only relevant if the backend distinguishes between a full write and a live (streaming) write. In `live` mode, `dataset_args` includes a positive `--rate` so the writer throttles its output; in `full` mode, `--rate 0` means unthrottled.
+The `plugin_write` arguments in order: `$1` = WRITER (the writer name), `$2` = MODE (`full` or `live`), `$3` = INDEX (the partition index, 0-based), `$4` = SERVER\_ID. The plugin constructs its own storage target name using `ds_name()` (see "Plugin meta files" below) — the core does not pass a target. MODE is only relevant if the backend distinguishes between a full write and a live (streaming) write. In `live` mode, `dataset_args` includes a positive `--rate` so the writer throttles its output; in `full` mode, `--rate 0` means unthrottled.
 
 The writer's summary line is a single JSON object on stdout, for example:
 
@@ -77,13 +77,169 @@ The writer's summary line is a single JSON object on stdout, for example:
 
 The harness records it and prints these fields: `writer`, `records`, `write_s`, `close_sync_s`, `records_per_s`.
 
+### Plugin meta files
+
+Each backend plugin is responsible for constructing its own storage target
+name and recording where and how it stored the data. The plugin writes a
+JSON storage meta file to `meta/storage-<writer>.json` during the write
+phase. The query engine reads this file to find the storage target, rather
+than reconstructing paths by convention.
+
+The helper function `ds_name()` (defined in `bin/node.sh`) reads the dataset
+definition's `"name"` field from the `DATASET` JSON file. Use it to construct
+your target name. The convention is `"$(ds_name)_${writer}"` for full mode
+and `"$(ds_name)_live"` for live mode, but the plugin is free to choose.
+
+The meta file must be valid JSON. Its contents are backend-specific, but it
+should include at least the storage target name. Examples:
+
+**SOS/DSOS** (`meta/storage-c.json`):
+
+```json
+{
+  "target": "monitoring_nested_c",
+  "backend": "sos",
+  "data_root": "/data/monbench/output/sos-dsos/nodes/server-01/data",
+  "container_path": "/data/monbench/output/sos-dsos/nodes/server-01/data/monitoring_nested_c"
+}
+```
+
+**InfluxDB** (`meta/storage-influx.json`):
+
+```json
+{
+  "measurement": "monitoring_nested",
+  "database": "monbench",
+  "host": "http://influx-host:8181"
+}
+```
+
+The query engine reads the storage meta file and populates `ctx["target"]` from:
+- `"target"` key (SOS/DSOS)
+- `"measurement"` key (InfluxDB)
+- Fallback convention: `"<ds_name>_<writer>"` (normal) or `"<ds_name>_live"` (live mode)
+
+**Available helpers from `node.sh`:** `HOST`, `PLUGIN_DIR`, `log`, `die`,
+`run_logged`, `ds_name`, `dataset_args` (array, in `plugin_write`), and
+every setting from `bench.conf` and `<name>_backend.conf`.
+
+### OUTPUT_DIR layout
+
+Each backend pair runs under `OUTPUT_DIR/<pair>/`. The harness creates the
+top-level subdirectories before any phase runs. When `BACKENDS` names more
+than one pair, each pair gets its own isolated tree.
+
+```
+OUTPUT_DIR/<pair>/
+  meta/                                 # backend-level metadata (shared across nodes)
+  nodes/                                # per-server scratch (one subdir per hostname)
+    <hostname>/
+      data/                             #   backend storage
+      run/                              #   daemon runtime
+      tmp/                              #   transient node-local files
+  results/                              # benchmark statistics (user-facing output)
+  logs/                                 # all logs
+```
+
+#### `meta/` — backend-level operational metadata
+
+Files that are the same across all server nodes or that coordinate between
+phases. Written once, readable from any node (must be on a shared
+filesystem or copied). Both plugin-written and core-written meta files live
+here.
+
+| File | Written by | Purpose |
+| --- | --- | --- |
+| `storage-<writer>.json` | plugin (`plugin_write`) | Where writer `<writer>` stored data — the writer→query handoff. Core contract: the query engine reads this to find the storage target (see "Plugin meta files" above) |
+| `dataset-<writer>.json` | core (`dataset.py`) | Dataset parameters for writer `<writer>` — used by the query engine for verification |
+| Backend-specific shared config | plugin | Any file that is identical across servers and needed by multiple nodes or phases |
+
+Backend-specific shared config examples:
+
+| Backend | File | Purpose |
+| --- | --- | --- |
+| DSOS | `dsosd-directory.json` | Routing config listing all server endpoints (same on every server) |
+| SOS | `sos-schema.json` | SOS schema template derived from the dataset definition |
+| DSOS | `dsos-write-session.txt` | Session file listing all participating servers |
+
+**Naming rule**: plugin-written files should use a descriptive prefix.
+`storage-<writer>.json` is the required name for plugin meta. Other files
+use the backend name or a short description as prefix (e.g.
+`dsosd-directory.json`, not `directory.json`).
+
+#### `nodes/<hostname>/` — per-server scratch
+
+Everything specific to one server node. Each node creates its own
+subdirectory using its hostname. All files here are considered scratch —
+wiped on clean.
+
+| Subdirectory | What goes here | Examples |
+| --- | --- | --- |
+| `data/` | Backend storage — the actual database files the backend manages | SOS containers (`monitoring_nested_c/`), InfluxDB data directory |
+| `run/` | Daemon runtime files needed to manage a running service | PID files (`dsosd.pid`), auth tokens (`influxdb3-token.json`) |
+| `tmp/` | Transient files that can be deleted after the run completes | (empty in most cases; available for future use) |
+
+**Naming rule**: files do not need a hostname suffix — the parent directory
+already identifies the node. Use `dsosd.pid`, not `dsosd-server-01.pid`.
+
+**`data/` override**: For HPC sites where database storage must reside on
+fast local disk (NVMe, local SSD) rather than the shared filesystem where
+`OUTPUT_DIR` may live, backends provide an independently overridable path
+for their storage. For example, `SOS_DATA_ROOT` overrides where SOS
+containers go (default: `nodes/<hostname>/data`), and `INFLUX_DATA_DIR`
+overrides InfluxDB's data directory. The override only affects `data/`;
+the rest of the node's `run/` and `tmp/` stay under `nodes/<hostname>/`.
+
+#### `results/` — benchmark statistics
+
+Only benchmark output that the user reads. No operational or intermediate
+files. See `OUTPUT.md` for the full specification of each file's structure.
+
+| File pattern | Written by | Contents |
+| --- | --- | --- |
+| `write-<writer>-<host>.json` | each writer | Write throughput summary for that host |
+| `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (write + query stats) |
+| `benchmark-<writer>-live.json` | `core/bench.py` | Live-poll benchmark result |
+
+#### `logs/` — all logs
+
+Every log file in one directory. Log filenames include enough context to
+identify the source (phase, writer, hostname, adapter).
+
+| File pattern | Source | Contents |
+| --- | --- | --- |
+| `<phase>-<host>.log` | `run.sh` | Step log (stdout/stderr of a remote step) |
+| `<daemon>-<host>.log` | plugin | Daemon log (output from a background service) |
+| `benchmark-<writer>-<adapter>.log` | `core/bench.py` | Everything printed to stdout during the benchmark |
+
+Step log examples: `build-server-01.log`, `write-c-server-01.log`,
+`serve-write-server-01.log`. Daemon log examples: `dsosd-server-01.log`,
+`influxdb3-server-01.log`.
+
+#### Clean semantics
+
+```bash
+# Normal clean: wipe per-node scratch, keep results and logs
+rm -rf OUTPUT_DIR/<pair>/nodes
+
+# Full reset: wipe everything for this pair
+rm -rf OUTPUT_DIR/<pair>
+
+# Meta-only clean (re-run write phase): wipe meta and nodes
+rm -rf OUTPUT_DIR/<pair>/meta OUTPUT_DIR/<pair>/nodes
+```
+
+`plugin_clean` should clean its own `nodes/<hostname>/` subdirectories
+(the server's data, daemon files, and transient files). The harness handles
+cleaning `meta/` at the run level.
+
 #### Supporting `bin/run.sh -d` (dry run)
 
-`node.sh` defines `run_logged CMD ARGS...` (next to `log`/`die`, before your plugin is sourced): it logs a command's argv as a `"+ ...​"` line and then runs it, unless `DRY_RUN` is set, in which case it only logs. Route any plain external command your hooks run through it — the writer invocation in `plugin_write`, a compiler in `plugin_build`, `rm`/cleanup in `plugin_clean` — so `bin/run.sh -d` reports your backend's real commands too, consistently with the others.
+`node.sh` defines `run_logged CMD ARGS...` (next to `log`/`die`, before your plugin is sourced): it logs a command's argv as a `"+ ..."` line and then runs it, unless `DRY_RUN` is set, in which case it only logs. Route any plain external command your hooks run through it — the writer invocation in `plugin_write`, a compiler in `plugin_build`, `rm`/cleanup in `plugin_clean` — so `bin/run.sh -d` reports your backend's real commands too, consistently with the others.
 
-If your command reads a setting from its own environment rather than from an argv flag — most writers do this for `DATASET` — name it explicitly as `run_logged VAR=val -- CMD ARGS...` (note the literal `--`) instead of just `run_logged CMD ARGS...`. `run_logged` logs those `VAR=val` assignments as part of the `"+ ...​"` line and, for a real run, exports exactly those vars for `CMD` (equivalent to writing `VAR=val CMD ARGS...` by hand). Without this, the logged line still runs correctly from inside `node.sh` (the var is already in its environment), but is not something you can copy out and run standalone on the node — see `backends/sos/sos_plugin.sh`'s and `backends/dsos/dsos_plugin.sh`'s `plugin_write` (both pass `DATASET` this way) for examples, and `bin/node.sh`'s `run_logged` doc comment for the exact rule (only args before a literal `--` are treated as env assignments; with no `--` anywhere, everything is CMD/ARGS as before, so existing calls with no env vars need no change).
+If your command reads a setting from its own environment rather than from an argv flag — most writers do this for `DATASET` — name it explicitly as `run_logged VAR=val -- CMD ARGS...` (note the literal `--`) instead of just `run_logged CMD ARGS...`. `run_logged` logs those `VAR=val` assignments as part of the `"+ ..."` line and, for a real run, exports exactly those vars for `CMD` (equivalent to writing `VAR=val CMD ARGS...` by hand). Without this, the logged line still runs correctly from inside `node.sh` (the var is already in its environment), but is not something you can copy out and run standalone on the node — see `backends/sos/sos_plugin.sh`'s and `backends/dsos/dsos_plugin.sh`'s `plugin_write` (both pass `DATASET` this way) for examples, and `bin/node.sh`'s `run_logged` doc comment for the exact rule (only args before a literal `--` are treated as env assignments; with no `--` anywhere, everything is CMD/ARGS as before, so existing calls with no env vars need no change).
 
-A command that must be backgrounded or `exec`'d (typically in `plugin_serve_start`/`plugin_serve_run`) can't go through `run_logged` directly: log your own `"+ ...​"` line (including any `VAR=val` prefix the command needs, the same way) and check `[[ -n "${DRY_RUN:-}" ]]` yourself before actually starting or stopping anything. See `backends/sos/sos_plugin.sh` (`plugin_build`/`plugin_write`/`plugin_clean`) and `backends/dsos/dsos_plugin.sh` (`plugin_serve_start`/`plugin_serve_run`/`plugin_serve_stop`) for examples of both. If a hook reads a file that only a prior real (non-dry) step would have created (e.g. a token or session file), skip that read under `DRY_RUN` too — see `backends/influxdb/influxdb_plugin.sh`'s `plugin_write`.
+A command that must be backgrounded or `exec`'d (typically in `plugin_serve_start`/`plugin_serve_run`) can't go through `run_logged` directly: log your own `"+ ..."` line (including any `VAR=val` prefix the command needs, the same way) and check `[[ -n "${DRY_RUN:-}" ]]` yourself before actually starting or stopping anything. See `backends/sos/sos_plugin.sh` (`plugin_build`/`plugin_write`/`plugin_clean`) and `backends/dsos/dsos_plugin.sh` (`plugin_serve_start`/`plugin_serve_run`/`plugin_serve_stop`) for examples of both. If a hook reads a file that only a prior real (non-dry) step would have created (e.g. a token or session file), skip that read under `DRY_RUN` too — see `backends/influxdb/influxdb_plugin.sh`'s `plugin_write`.
 
 Separately, `bin/run.sh` itself now always prints the outer `env VAR=val ... bash bin/node.sh ACTION ARGS` line a step runs (for every launcher, not just `-l manual`) before running it — see `README.md`'s "Dry run" section and `bin/run.sh`'s "Reproducing a step by hand" comment. That line already carries every setting `CONFIG_VARS`/`PLUGIN_VARS` forward, so it needs nothing from you as a plugin author; `run_logged`'s `VAR=val --` convention above is only for a setting an external command you invoke reads from its own environment, which that outer line does not help with on its own once you're inside `node.sh`.
 
@@ -102,13 +258,13 @@ Every adapter instance receives `self.ctx`, a dict with these keys:
 
 | Key | Contains | Example |
 | --- | --- | --- |
-| `target` | The name of the written data (the container path for SOS, or the measurement name constructed as `{DATA_NAME}_{writer}`) | `monitoring_influx` |
-| `schema` | The dataset name from the JSON definition — the table name used in query strings and the name verification matches against | `monitoring` |
+| `target` | The storage target name, read from the plugin's storage meta file at `meta/storage-<writer>.json`. For SOS/DSOS this is the container name; for InfluxDB it is the measurement name. The query adapter does not need to know how the name was chosen | `monitoring_nested_c` |
+| `schema` | The dataset name from the JSON definition (`DS.name`) — the table name used in query strings and the name verification matches against | `monitoring_nested` |
 | `servers` | List of server hostnames from `SERVER_HOSTS` | `["node-1", "node-2"]` |
-| `run_dir` | Scratch directory on the current node | `/tmp/monbench-user/run` |
+| `output_dir` | This pair's output directory (`OUTPUT_DIR/<pair>/`), with `meta/`, `nodes/`, `results/`, `logs/` subdirectories | `/data/monbench/output/sos-dsos` |
 | `env` | The full environment (`os.environ`), including all settings from `bench.conf` and the backend's own config |  |
 
-The distinction between `target` and `schema` matters: `target` is the backend-specific storage name (used for connecting and probing), while `schema` is the dataset's logical name (used in query text via `{schema}` and in the verification engine). For backends where these are the same concept (like InfluxDB after the measurement-naming fix), `schema` is the correct one for query-related work.
+The distinction between `target` and `schema` matters: `target` is the backend-specific storage name (used for connecting and probing), while `schema` is the dataset's logical name (used in query text via `{schema}` and in the verification engine). For backends where these happen to be the same (like InfluxDB, where the measurement name is the dataset name), `schema` is the correct one for query-related work.
 
 #### Adapter methods
 
@@ -237,7 +393,7 @@ see `dataset/default.json` for the full list):
 
 | Field | Purpose |
 | --- | --- |
-| `name` | The schema name; used in query strings as `{schema}` and as the record type the verifier matches against |
+| `name` | The schema name; used in query strings as `{schema}` and as the record type the verifier matches against. This is also the single source of truth for the logical data name — the core never constructs storage names from it; that is the plugin's job |
 | `attributes` | The columns. `name` is how queries and the verifier refer to each one. `type` is used by `type_overrides` to apply per-backend column renaming and literal formatting |
 | `keys` | The access paths the data is meant to be queried by; each backend maps them onto its own indexing (e.g. SOS creates an index for each, InfluxDB maps tags) |
 

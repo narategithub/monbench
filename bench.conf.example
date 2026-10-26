@@ -51,27 +51,35 @@ QUERY_BACKEND="${QUERY_BACKEND:-}"
 # BENCH_DIR must exist at the same path on all nodes. On a shared filesystem
 # nothing needs copying; otherwise run 'bin/run.sh -l ssh deploy'.
 BENCH_DIR="${BENCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-# Per-node scratch area for logs, pid files and generated files. Also the
-# root each backend's on-disk data is placed under (see e.g. SOS_DATA_ROOT,
-# INFLUX_DATA_DIR in each backend's own config). When BACKENDS names more
-# than one pair, bin/run.sh appends a subdirectory named after each pair, so
-# they never share a path.
-RUN_DIR="${RUN_DIR:-/tmp/monbench-${USER:-$(id -un)}/run}"
-# Where write summaries, metadata files and query results are stored. Like
-# RUN_DIR, this gains a per-pair subdirectory when BACKENDS names more than
-# one pair.
-RESULTS_DIR="${RESULTS_DIR:-${BENCH_DIR}/results}"
+# Root directory for all run output. When BACKENDS names more than one pair,
+# bin/run.sh creates a subdirectory named after each pair, so they never
+# share a path. See EXTENDING.md, "OUTPUT_DIR layout" for the full spec.
+#
+# OUTPUT_DIR/<pair>/ layout:
+#   meta/                 backend-level metadata (shared across nodes)
+#     storage-<w>.json      where writer <w> stored data (plugin→query handoff)
+#     dataset-<w>.json      dataset params for writer <w> (core-written)
+#   nodes/<hostname>/     per-server scratch (wiped on clean)
+#     data/                 backend storage (containers, databases)
+#     run/                  daemon runtime (PID files, tokens)
+#     tmp/                  transient node-local files
+#   results/              benchmark statistics (user-facing output)
+#   logs/                 all logs (step, daemon, benchmark)
+OUTPUT_DIR="${OUTPUT_DIR:-${BENCH_DIR}/output}"
 
 # ---------------------------------------------------------------- software
 PYTHON="${PYTHON:-python3}"
 
 # ---------------------------------------------------------------- data set
 # Data set definition (attributes and keys); see dataset/default.json.
+# The definition's "name" field (DS.name) is the logical data/measurement
+# name -- each backend plugin uses it to construct its own storage paths
+# and records them in storage meta files at meta/storage-<writer>.json.
 DATASET="${DATASET:-${BENCH_DIR}/dataset/default.json}"
-# Writers to run; each writes its own target, <DATA_NAME>_<writer>, so they
-# can be compared. Empty selects the backend's default writers.
+# Writers to run; each writes its own storage target, named by the plugin
+# (typically <DS.name>_<writer>), so they can be compared. Empty selects
+# the backend's default writers.
 WRITERS="${WRITERS:-}"
-DATA_NAME="${DATA_NAME:-monitoring}"
 
 # Records per server = COMPONENT_IDS_PER_SERVER * SAMPLES (80,000 by default).
 COMPONENT_IDS_PER_SERVER="${COMPONENT_IDS_PER_SERVER:-16}"
@@ -93,7 +101,6 @@ LIMIT_N="${LIMIT_N:-100}"
 
 # ---------------------------------------------------------------- live test
 LIVE_WRITER="${LIVE_WRITER:-}"   # empty = the first of WRITERS
-LIVE_TARGET="${LIVE_TARGET:-${DATA_NAME}_live}"
 LIVE_RATE="${LIVE_RATE:-2000}"   # records per second per server
 LIVE_BATCH="${LIVE_BATCH:-500}"
 LIVE_SAMPLES="${LIVE_SAMPLES:-1500}"

@@ -9,13 +9,14 @@
 #                directory is already shared) -- runs once, before any pair
 #   build        build the backend's writers on each server node
 #   serve-write  start the write backend's service on the servers, if it has one
-#   write        write the data set on the servers, once per writer in WRITERS,
-#                and record a metadata file for each target
+#   write        write the data set on the servers, once per writer in WRITERS;
+#                each plugin determines its own storage name and records it in
+#                a metadata file under OUTPUT_DIR/<pair>/meta/
 #   serve-query  start the query backend's service on the servers, if it has one
 #                (skipped when it is the same service as serve-write)
-#   check        verify query results from the query node, once per target
-#                (no timing)
-#   query        time the query set from the query node, once per target
+#   check        verify query results from the query node, once per writer
+#                (no timing); reads the writer's meta file for the storage name
+#   query        time the query set from the query node, once per writer
 #                (no verification)
 #   live         write a new target slowly while the query node polls it
 #   stop         stop both backend services
@@ -42,7 +43,7 @@
 #
 # Reproducing a step by hand: every launcher now logs the exact "env
 # VAR=val ... bash bin/node.sh ACTION ARGS..." line a step runs, to that
-# step's log file under RESULTS_DIR/logs (see remote() below) -- self-
+# step's log file under OUTPUT_DIR/logs (see remote() below) -- self-
 # contained, so it can be copied onto the named host and run as-is, with
 # or without -d. With -d (or -l manual), that line also prints to stdout,
 # since it IS the result there; on a real ssh/slurm run it only goes to
@@ -64,19 +65,20 @@
 #   in the order listed, before moving to the next pair (deploy excepted --
 #   it runs once, since it does not depend on the backend).
 #
-#   RUN_DIR and RESULTS_DIR (and so each backend's on-disk data -- see e.g.
-#   SOS_DATA_ROOT, INFLUX_DATA_DIR) are both namespaced per pair, named after
-#   it (e.g. "sos-dsos", "influxdb"). That name is fixed once per pair (see
-#   run_pair below) and reused by every phase in it -- build, write, check,
-#   query, ... -- regardless of which single backend (the write backend, or
-#   the query backend) is actually doing the work for a given phase. That is
-#   what keeps a pair's write and query sides agreeing on where the data is:
-#   e.g. for "sos:dsos", the write phase (handled by sos) and the check/query
-#   phases (handled by dsos, reading the very same on-disk containers sos
-#   wrote) both resolve RUN_DIR from the one fixed "sos-dsos" pair name,
-#   rather than from whichever single backend happens to be running that
-#   particular phase -- keying it that way (e.g. "sos" while writing, "dsos"
-#   while querying) is what caused them to disagree before.
+#   OUTPUT_DIR is namespaced per pair, named after it (e.g. "sos-dsos",
+#   "influxdb"). That name is fixed once per pair (see run_pair below) and
+#   reused by every phase in it.
+#
+#   OUTPUT_DIR/<pair>/ layout (see EXTENDING.md for the full spec):
+#     meta/                backend-level metadata (shared across nodes)
+#       storage-<w>.json     where writer <w> stored data (plugin→query handoff)
+#       dataset-<w>.json     dataset params for writer <w> (core-written)
+#     nodes/<hostname>/    per-server scratch (wiped on clean)
+#       data/                backend storage (containers, databases)
+#       run/                 daemon runtime (PID files, tokens)
+#       tmp/                 transient node-local files
+#     results/             benchmark statistics (user-facing output)
+#     logs/                all logs (step, daemon, benchmark)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -131,9 +133,8 @@ for _chk in "${PAIRS[@]}"; do
 		{ echo "no backend configured: set BACKENDS, or WRITE_BACKEND/QUERY_BACKEND, in bench.conf (see bench.conf.example)" >&2; exit 1; }
 done
 
-# RUN_DIR and RESULTS_DIR are both namespaced per pair below (see run_pair).
-BASE_RUN_DIR="${RUN_DIR}"
-BASE_RESULTS_DIR="${RESULTS_DIR}"
+# OUTPUT_DIR is namespaced per pair below (see run_pair).
+BASE_OUTPUT_DIR="${OUTPUT_DIR}"
 
 [[ -n "${SERVER_HOSTS:-}" ]] || { echo "SERVER_HOSTS must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
 [[ -n "${QUERY_HOST:-}" ]] || { echo "QUERY_HOST must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
@@ -174,7 +175,7 @@ wait_for_user() {
 # Run one node action and wait for it. The node_cmd() line itself -- the
 # full "env VAR=val ... bash bin/node.sh ACTION ARGS" invocation, self-
 # contained with every setting the step needs -- is always written to the
-# step's log file under RESULTS_DIR/logs, so it can be copied onto the host
+# step's log file under OUTPUT_DIR/logs, so it can be copied onto the host
 # and rerun by hand (e.g. under gdb) exactly as the harness ran it. It also
 # prints to stdout under DRY_RUN (there is nothing else to show, and it IS
 # the result), and always for -l manual (showing it is manual mode's whole
@@ -274,15 +275,17 @@ phase_build() {
 }
 
 phase_write() {
-	local w target
+	local w
 	for w in ${WRITERS}; do
-		target="${DATA_NAME}_${w}"
-		say "write: ${target} with the ${WRITE_BACKEND} ${w} writer on ${SERVERS[*]}"
-		if BE="${WRITE_BACKEND}" on_servers "write-${target}" write "$w" "$target" full; then
-			# Record what was written, where the query node will read it.
-			BE="${WRITE_BACKEND}" remote "${QUERY_HOST}" "meta-${target}" meta "$target" "$w" full || FAILED=1
+		say "write: ${w} writer (${WRITE_BACKEND}) on ${SERVERS[*]}"
+		if BE="${WRITE_BACKEND}" on_servers "write-${w}" write "$w" full; then
+			# Record what was written; the plugin wrote storage details to
+			# OUTPUT_DIR/meta/storage-<writer>.json on each server, and this
+			# meta step on the query node writes the dataset/params metadata
+			# that the query engine reads.
+			BE="${WRITE_BACKEND}" remote "${QUERY_HOST}" "meta-${w}" meta "$w" full || FAILED=1
 			# Print the ingest performance summary.
-			remote "${QUERY_HOST}" "write-summary-${target}" write-summary "$target" || FAILED=1
+			remote "${QUERY_HOST}" "write-summary-${w}" write-summary "$w" || FAILED=1
 		else
 			FAILED=1
 		fi
@@ -362,34 +365,32 @@ phase_query_serve() {
 }
 
 phase_check() {
-	local w target
+	local w
 	for w in ${WRITERS}; do
-		target="${DATA_NAME}_${w}"
-		say "check: ${target} from ${QUERY_HOST}"
-		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-${target}" check "$target" || FAILED=1
+		say "check: ${w} writer from ${QUERY_HOST}"
+		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-${w}" check "$w" || FAILED=1
 	done
 }
 
 phase_query() {
-	local w target
+	local w
 	for w in ${WRITERS}; do
-		target="${DATA_NAME}_${w}"
-		say "query: ${target} from ${QUERY_HOST}"
-		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "query-${target}" query "$target" || FAILED=1
+		say "query: ${w} writer from ${QUERY_HOST}"
+		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "query-${w}" query "$w" || FAILED=1
 	done
 }
 
 phase_live() {
 	say "live: ${LIVE_WRITER} writer at ${LIVE_RATE} records/s per server while ${QUERY_HOST} polls"
 	if [[ "$LAUNCHER" == "manual" ]]; then
-		on_servers "write-${LIVE_TARGET}" write "${LIVE_WRITER}" "${LIVE_TARGET}" live
-		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-live" check "${LIVE_TARGET}" live
+		on_servers "write-live" write "${LIVE_WRITER}" live
+		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-live" check "${LIVE_WRITER}" live
 		return 0
 	fi
-	BE="${WRITE_BACKEND}" on_servers "write-${LIVE_TARGET}" write "${LIVE_WRITER}" "${LIVE_TARGET}" live &
+	BE="${WRITE_BACKEND}" on_servers "write-live" write "${LIVE_WRITER}" live &
 	local writers_pid=$!
 	sleep 3
-	BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-live" check "${LIVE_TARGET}" live || FAILED=1
+	BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-live" check "${LIVE_WRITER}" live || FAILED=1
 	wait "$writers_pid" || FAILED=1
 }
 
@@ -448,17 +449,25 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	WRITE_BACKEND="$1" QUERY_BACKEND="$2"
 	PAIR_NAME="${WRITE_BACKEND}"
 	[[ "${WRITE_BACKEND}" != "${QUERY_BACKEND}" ]] && PAIR_NAME="${WRITE_BACKEND}-${QUERY_BACKEND}"
-	# RUN_DIR and RESULTS_DIR: namespaced per pair, fixed once here for the
-	# whole pair's run and reused by every phase below (build, write, check,
-	# query, ...) regardless of which single backend -- write or query -- is
-	# actually doing the work for a given phase. That is what keeps a pair's
-	# write and query sides agreeing on where the data is: both read the one
-	# fixed PAIR_NAME-derived RUN_DIR, rather than a path keyed by whichever
-	# single backend happens to be running that particular phase.
-	RUN_DIR="${BASE_RUN_DIR}/${PAIR_NAME}"
-	RESULTS_DIR="${BASE_RESULTS_DIR}/${PAIR_NAME}"
-	LOG_DIR="${RESULTS_DIR}/logs"
+	# OUTPUT_DIR: namespaced per pair, fixed once here for the whole pair's
+	# run and reused by every phase below (build, write, check, query, ...)
+	# regardless of which single backend -- write or query -- is actually
+	# doing the work for a given phase. That is what keeps a pair's write
+	# and query sides agreeing on where the data is: both read the one
+	# fixed PAIR_NAME-derived OUTPUT_DIR, rather than a path keyed by
+	# whichever single backend happens to be running that particular phase.
+	OUTPUT_DIR="${BASE_OUTPUT_DIR}/${PAIR_NAME}"
+	LOG_DIR="${OUTPUT_DIR}/logs"
 	mkdir -p "$LOG_DIR"
+	# Create the well-defined OUTPUT_DIR subdirectory layout (see
+	# EXTENDING.md for the full spec):
+	#   meta/     backend-level metadata (shared across nodes; write→query
+	#             handoff and dataset params)
+	#   results/  benchmark statistics (user-facing output)
+	#   logs/     all logs (step, daemon, benchmark)
+	# nodes/<hostname>/ subdirectories (data/, run/, tmp/) are created by
+	# each plugin on its own server host.
+	mkdir -p "${OUTPUT_DIR}/meta" "${OUTPUT_DIR}/results" "${OUTPUT_DIR}/logs"
 	FAILED=0
 
 	check_plugin "${WRITE_BACKEND}"
@@ -501,10 +510,10 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 
 	# Settings forwarded to every remote step so that environment overrides
 	# given to run.sh apply on all nodes, not only here.
-	CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_HOSTS QUERY_HOST BENCH_DIR RUN_DIR RESULTS_DIR
-		ENV_SETUP PYTHON DATASET WRITERS DATA_NAME COMPONENT_IDS_PER_SERVER SAMPLES T0
+	CONFIG_VARS=(BE WRITE_BACKEND QUERY_BACKEND SERVER_HOSTS QUERY_HOST BENCH_DIR OUTPUT_DIR
+		ENV_SETUP PYTHON DATASET WRITERS COMPONENT_IDS_PER_SERVER SAMPLES T0
 		INTERVAL JOB_LEN BATCH QUERY_ADAPTER QUERY_FILE REPEAT LIMIT_N
-		LIVE_WRITER LIVE_TARGET LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL DRY_RUN)
+		LIVE_WRITER LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL DRY_RUN)
 	# Forward each plugin's own settings too, from both backends.
 	for _bc in "${WRITE_BACKEND}" "${QUERY_BACKEND}"; do
 		_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/${_bc}_backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"
@@ -515,8 +524,7 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 
 	echo "monbench: pair=${PAIR_NAME} write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHER} servers=${SERVERS[*]} query-host=${QUERY_HOST}"
 	echo "          ${COMPONENT_IDS_PER_SERVER} component IDs x ${SAMPLES} samples per server, writers: ${WRITERS}"
-	echo "          data: ${RUN_DIR}"
-	echo "          results: ${RESULTS_DIR}"
+	echo "          output: ${OUTPUT_DIR}"
 
 	for phase in "${RUN_PHASES[@]}"; do
 		say "phase: ${phase} (${PAIR_NAME})"

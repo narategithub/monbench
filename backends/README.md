@@ -21,8 +21,20 @@ error before doing anything.
 To add a backend, copy `backends/template/` to `backends/<n>/` and rename
 each file with your backend's name as a prefix: `<n>_plugin.sh`,
 `<n>_backend.conf`, `query/<n>_query.py`. See `EXTENDING.md` for the full
-contract: config declarations, plugin hooks, writer summary format, query
-adapter interface, `type_overrides`, and a testing walkthrough.
+contract: config declarations, plugin hooks, writer summary format, plugin
+meta files, query adapter interface, `type_overrides`, and a testing
+walkthrough.
+
+## Storage naming
+
+Each backend plugin constructs its own storage target name during the write
+phase, using the `ds_name()` helper to read the dataset definition's `"name"`
+field. The plugin records the target name and any other storage-specific
+information in a storage meta file at `meta/storage-<writer>.json` (under
+the pair's `OUTPUT_DIR`). The query engine reads this file to find where the
+data lives — the core never constructs or passes storage target names. See
+`EXTENDING.md`, "Plugin meta files" for the full contract and
+"OUTPUT_DIR layout" for the directory structure.
 
 ## Backends provided
 
@@ -63,9 +75,9 @@ Two options in `backends/influxdb/influxdb_backend.conf`:
 - `INFLUX_QUERY_LANG`: `sql` (default) or `influxql`.
 
 The data set maps to InfluxDB as: measurement = the data set name
-(`{schema}`); tags = `component_id`, `job_id`; fields = every other dataset
-attribute, including `seq` (kept as a field so verification can identify
-each row).
+(`ds_name()`, which reads the dataset definition's `"name"` field); tags =
+`component_id`, `job_id`; fields = every other dataset attribute, including
+`seq` (kept as a field so verification can identify each row).
 
 Requirements: an InfluxDB 3 server reachable at `INFLUX_HOST`. The `python`
 interface also needs `pip install influxdb3-python` on the write and query

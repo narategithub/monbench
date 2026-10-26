@@ -45,13 +45,18 @@ instead (Sec 6.5's backend-mapping table; STATUS.md).
 Every writer, in any backend, must produce exactly these values; the
 query engine verifies answers against them.
 
-After a write, the harness records what was written in a metadata file,
-<RESULTS_DIR>/meta/<target>.json. The query engine reads it so that it
-verifies against the data actually written, and so that it can refuse to
-query a target written for a different backend.
+After a write, the harness records what was written in a dataset metadata
+file, <OUTPUT_DIR>/meta/dataset-<writer>.json. The query engine reads it
+so that it verifies against the data actually written, and so that it can
+refuse to query a writer whose data was produced by a different backend.
+
+The backend plugin separately records storage-specific information (the
+target name it chose, paths, database names, etc.) in a storage meta file
+at <OUTPUT_DIR>/meta/storage-<writer>.json. The query engine reads that
+to discover where the data lives (see core/bench.py's _read_plugin_meta()).
 
 Command line (used by bin/node.sh):
-  dataset.py meta TARGET WRITER MODE    write the metadata file for TARGET
+  dataset.py meta WRITER MODE    write the metadata file for WRITER
 """
 import datetime
 import json
@@ -294,16 +299,15 @@ class Dataset:
 # ---------------------------------------------------------------- metadata
 
 
-def meta_path(target):
-    return os.path.join(os.environ["RESULTS_DIR"], "meta", f"{target}.json")
+def meta_path(writer):
+    return os.path.join(os.environ["OUTPUT_DIR"], "meta", f"dataset-{writer}.json")
 
 
-def write_meta(target, writer, mode):
+def write_meta(writer, mode):
     ds = Dataset.from_env(live=(mode == "live"))
     meta = {
         "format": META_FORMAT,
         "backend": os.environ["BACKEND"],
-        "target": target,
         "writer": writer,
         "write_hosts": os.environ["SERVER_HOSTS"].split(),
         "dataset": ds.definition,
@@ -311,15 +315,15 @@ def write_meta(target, writer, mode):
         "records": ds.size(),
         "written_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
-    path = meta_path(target)
+    path = meta_path(writer)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"metadata: {path}")
 
 
-def read_meta(target):
-    path = meta_path(target)
+def read_meta(writer):
+    path = meta_path(writer)
     if not os.path.exists(path):
         return None
     with open(path) as f:
@@ -330,7 +334,7 @@ def read_meta(target):
 
 
 def main(argv):
-    if len(argv) == 4 and argv[0] == "meta":
+    if len(argv) == 3 and argv[0] == "meta":
         write_meta(*argv[1:])
         return 0
     print(__doc__, file=sys.stderr)

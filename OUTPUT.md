@@ -3,29 +3,35 @@
 This document describes the files monbench produces, the structure of the
 JSON result files, and exactly what each timing measurement covers.
 
+For the full `OUTPUT_DIR` directory layout — where each file goes, what
+each subdirectory is for, and the naming conventions plugins must follow —
+see `EXTENDING.md`, "OUTPUT_DIR layout".
+
 
 ## Files
 
-After a run, `results/` contains:
+After a run, `OUTPUT_DIR/<pair>/` contains:
 
-| Path pattern | Written by | Contents |
-|---|---|---|
-| `write-<target>-<host>.json` | each writer | one JSON object per writer run on that host |
-| `meta/<target>.json` | `core/dataset.py` | the data set parameters and writer identity for that target |
-| `benchmark-<target>-<adapter>.json` | `core/bench.py` | the combined benchmark result (see structure below) |
-| `benchmark-<target>-<adapter>.log` | `core/bench.py` | everything printed to stdout during the benchmark |
-| `benchmark-<target>-live.json` | `core/bench.py` | live-poll result (see structure below) |
-| `logs/` | the harness | full stdout/stderr of every remote step |
+| Directory | Path pattern | Written by | Contents |
+|---|---|---|---|
+| `meta/` | `storage-<writer>.json` | plugin (`plugin_write`) | Where the writer stored data (writer→query handoff) |
+| `meta/` | `dataset-<writer>.json` | `core/dataset.py` | Dataset parameters and writer identity for verification |
+| `results/` | `write-<writer>-<host>.json` | each writer | One JSON object per writer run on that host |
+| `results/` | `benchmark-<writer>-<adapter>.json` | `core/bench.py` | Combined benchmark result (see structure below) |
+| `results/` | `benchmark-<writer>-live.json` | `core/bench.py` | Live-poll result (see structure below) |
+| `logs/` | `<phase>-<host>.log` | the harness | Full stdout/stderr of every remote step |
+| `logs/` | `benchmark-<writer>-<adapter>.log` | `core/bench.py` | Everything printed to stdout during the benchmark |
 
 
 ## Benchmark result JSON
 
-The main result file, `benchmark-<target>-<adapter>.json`, has this
+The main result file, `results/benchmark-<writer>-<adapter>.json`, has this
 structure:
 
 ```
 {
-  "target":    "<target name>",
+  "writer":    "<writer name>",
+  "target":    "<storage target from plugin meta>",
   "dataset":   { ... },           # data set parameters (see below)
   "servers":   ["host1", ...],    # server hosts used
   "dry_run":   true|false,        # true if DRY_RUN was set for this run (see below)
@@ -34,6 +40,12 @@ structure:
   "all_passed": true|false        # false if any check failed
 }
 ```
+
+The `writer` field is the writer name (e.g. `"c"`, `"py"`, `"influx"`).
+The `target` field is the backend-specific storage target read from the
+plugin's storage meta file at `meta/storage-<writer>.json` — for SOS/DSOS
+this is the container name (e.g. `"monitoring_nested_c"`), for InfluxDB the
+measurement name (e.g. `"monitoring_nested"`).
 
 ### `dataset`
 
@@ -142,7 +154,7 @@ the query's final text was resolved and reported, but never sent.
 
 ## Live result JSON
 
-The live result file, `benchmark-<target>-live.json`, uses the same
+The live result file, `results/benchmark-<writer>-live.json`, uses the same
 top-level structure as the standard benchmark result, but its query results
 contain no timing fields. Instead, each entry is a pass/fail check on the
 live-poll behaviour:

@@ -36,11 +36,16 @@ class Adapter:
 
     def __init__(self, ctx):
         """ctx: dict with
-             target   name of the data written (container, database, ...)
-             schema   data-set name (the record type)
-             servers  list of server hosts from SERVER_HOSTS
-             run_dir  scratch directory on this node
-             env      the harness settings (os.environ)
+             target     storage target name (container, measurement, ...).
+                        Populated by bench.py from the backend plugin's meta
+                        file at OUTPUT_DIR/meta/storage-<writer>.json, which
+                        the plugin writes during the write phase. The query
+                        adapter does not need to know how the name was chosen.
+             schema     data-set name (the record type), from DS.name
+             servers    list of server hosts from SERVER_HOSTS
+             output_dir run output directory on this node (with meta/,
+                        nodes/<hostname>/, results/, logs/ subdirectories)
+             env        the harness settings (os.environ)
         """
         self.ctx = ctx
 

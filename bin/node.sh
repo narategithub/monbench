@@ -4,14 +4,15 @@
 # Backend-specific work is delegated to backends/<BACKEND>/<BACKEND>_plugin.sh.
 #
 #   node.sh build                                  build the backend's writers
-#   node.sh write WRITER TARGET full|live INDEX ID write data-set partition INDEX
-#                                                  into TARGET (server node)
-#   node.sh meta TARGET WRITER full|live           record what was written
-#   node.sh write-summary TARGET                   print ingest summary (query node)
+#   node.sh write WRITER full|live INDEX ID        write data-set partition INDEX
+#                                                  (server node); the plugin
+#                                                  determines the storage name
+#   node.sh meta WRITER full|live                  record what was written
+#   node.sh write-summary WRITER                   print ingest summary (query node)
 #   node.sh serve-start ID | serve-run ID          start the backend service
 #   node.sh serve-stop | serve-status              stop / check it
-#   node.sh check TARGET [live]                    verify query results (query node)
-#   node.sh query TARGET                           time the query set (query node)
+#   node.sh check WRITER [live]                    verify query results (query node)
+#   node.sh query WRITER                           time the query set (query node)
 #   node.sh clean ID                               delete this server's data
 set -euo pipefail
 
@@ -83,13 +84,10 @@ run_logged() { # [VAR=val ...] -- CMD ARGS...
 	fi
 }
 
-# Every target the harness writes: one per writer, plus the live-test target.
-all_targets() {
-	local w
-	for w in ${WRITERS}; do
-		echo "${DATA_NAME}_${w}"
-	done
-	echo "${LIVE_TARGET:-}"
+# Read the dataset definition's "name" field. Used by plugins to construct
+# storage names (e.g. container paths, measurement names).
+ds_name() {
+	"${PYTHON}" -c "import json,sys; print(json.load(open(sys.argv[1]))['name'])" "${DATASET}"
 }
 
 # shellcheck source=../backends/sos/sos_plugin.sh
@@ -106,8 +104,8 @@ hook() { # NAME ARGS...
 	fi
 }
 
-cmd_write() { # WRITER TARGET MODE INDEX ID
-	local target="$2" mode="$3" out
+cmd_write() { # WRITER MODE INDEX ID
+	local writer="$1" mode="$2" out
 	local samples="${SAMPLES:-}" batch="${BATCH:-}" rate=0
 	if [[ "$mode" == "live" ]]; then
 		samples="${LIVE_SAMPLES:-}" batch="${LIVE_BATCH:-}" rate="${LIVE_RATE:-}"
@@ -116,8 +114,12 @@ cmd_write() { # WRITER TARGET MODE INDEX ID
 	dataset_args=(--components "${COMPONENT_IDS_PER_SERVER:-}" --samples "$samples"
 		--t0 "${T0:-}" --interval "${INTERVAL:-}" --job-len "${JOB_LEN:-}"
 		--batch "$batch" --rate "$rate")
-	mkdir -p "${RESULTS_DIR:-}"
-	out="${RESULTS_DIR}/write-${target}-${HOST}.json"
+	# The plugin constructs the storage name and records it in a meta file.
+	# The writer's output (JSON summary) is saved under OUTPUT_DIR/results
+	# keyed by the writer name; the plugin_write hook is responsible for
+	# naming the storage target.
+	mkdir -p "${OUTPUT_DIR}/results"
+	out="${OUTPUT_DIR}/results/write-${writer}-${HOST}.json"
 	local rc=0
 	# With pipefail, the pipeline fails when the writer fails.
 	hook write "$@" | tee "$out.tmp" || rc=1
@@ -127,8 +129,8 @@ cmd_write() { # WRITER TARGET MODE INDEX ID
 	return "$rc"
 }
 
-cmd_bench() { # MODE TARGET [live]
-	local args=(--target "$2" --mode "$1")
+cmd_bench() { # MODE WRITER [live]
+	local args=(--writer "$2" --mode "$1")
 	[[ "${3:-}" == "live" ]] && args+=(--live)
 	"${PYTHON:-}" "${BENCH_DIR}/core/bench.py" "${args[@]}"
 }

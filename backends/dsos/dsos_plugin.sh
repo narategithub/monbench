@@ -11,12 +11,16 @@
 # queried by either the sos or dsos backend.
 #
 # Hooks (see backends/README.md):
-#   plugin_write WRITER TARGET MODE INDEX ID  write through dsosd
+#   plugin_write WRITER MODE INDEX ID     write through dsosd; the plugin
+#                                         constructs the storage name from
+#                                         DS.name and the writer, and records
+#                                         it in a storage meta file at
+#                                         OUTPUT_DIR/meta/storage-<writer>.json
 #   plugin_serve_start ID / plugin_serve_run ID / plugin_serve_stop /
-#   plugin_serve_status                       manage dsosd on this server
-#   plugin_clean ID                           delete containers and run files
+#   plugin_serve_status                   manage dsosd on this server
+#   plugin_clean ID                       delete containers and run files
 #
-# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, all_targets,
+# Available from node.sh: HOST, PLUGIN_DIR, log, die, run_logged, ds_name,
 # dataset_args (array), and every setting from bench.conf and dsos_backend.conf.
 #
 # Set DRY_RUN=1 (bin/run.sh's -d flag) to log the dsosd/writer command this
@@ -30,9 +34,12 @@
 # RPC program number of the D/SOS service (program SOSDB in sosapi.x).
 SOSDB_PROG=40009862
 SOSDB_VERS=1
-PIDFILE="${RUN_DIR}/dsosd-${HOST}.pid"
-LOGFILE="${RUN_DIR}/dsosd-${HOST}.log"
-DIRFILE="${RUN_DIR}/dsosd-directory-${HOST}.json"
+# Per-node runtime files under nodes/<hostname>/run/.
+PIDFILE="${OUTPUT_DIR}/nodes/${HOST}/run/dsosd.pid"
+# Daemon logs go to the shared logs/ directory.
+LOGFILE="${OUTPUT_DIR}/logs/dsosd-${HOST}.log"
+# The dsosd directory config is backend-level metadata (shared across nodes).
+DIRFILE="${OUTPUT_DIR}/meta/dsosd-directory.json"
 
 # This backend's own directory (for the writer and make_schema.py, which
 # are shared with the sos backend).
@@ -44,24 +51,36 @@ container_path() { # SERVER_ID TARGET
 }
 
 # Session file pointing to the local dsosd, used by the writer.
+# Backend-level metadata (shared across nodes).
 write_session_file() {
-	local path="${RUN_DIR}/dsos-write-session-${HOST}.txt"
-	mkdir -p "${RUN_DIR}"
+	local path="${OUTPUT_DIR}/meta/dsos-write-session.txt"
+	mkdir -p "${OUTPUT_DIR}/meta"
 	echo "${HOST}" >"${path}"
 	echo "${path}"
 }
 
 # ----------------------------------------------------------------- write
 
-plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
-	local writer="$1" target="$2" index="$4" id="$5"
+plugin_write() { # WRITER MODE INDEX SERVER_ID
+	local writer="$1" mode="$2" index="$3" id="$4"
+	# Construct the storage name from the dataset definition's name field
+	# and the writer name. Live mode uses a separate target so it does not
+	# overwrite the full data set.
+	local ds target
+	ds="$(ds_name)"
+	if [[ "$mode" == "live" ]]; then
+		target="${ds}_live"
+	else
+		target="${ds}_${writer}"
+	fi
 	local path template session
 	path="$(container_path "$id" "$target")"
 	# Start from an empty container so that reruns do not add duplicates.
 	run_logged rm -rf "$path"
-	mkdir -p "$(dirname "$path")" "${RUN_DIR}"
+	mkdir -p "$(dirname "$path")" "${OUTPUT_DIR}/meta"
 	# Reuse the sos backend's make_schema.py — the schema is identical.
-	template="${RUN_DIR}/sos-schema-${HOST}.json"
+	# The schema template is backend-level metadata (shared across nodes).
+	template="${OUTPUT_DIR}/meta/sos-schema.json"
 	"${PYTHON}" "${SOS_DIR}/make_schema.py" "${DATASET}" "$template"
 	# Update the dsosd directory file so it knows about this target.
 	write_directory "$id"
@@ -70,6 +89,8 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 		--template "$template" --node-index "$index"
 		"${dataset_args[@]}")
 	log "writing ${target} (dsos writer, through dsosd on ${HOST}) to ${path}"
+	# Record where we stored data so the query side can find it.
+	_dsos_write_meta "$writer" "$target" "$id"
 	case "$writer" in
 	dsos)
 		run_logged DATASET="${DATASET}" -- "${PYTHON}" "${DSOS_DIR}/writer/dsos_write.py" "${args[@]}"
@@ -80,18 +101,69 @@ plugin_write() { # WRITER TARGET MODE INDEX SERVER_ID
 	esac
 }
 
-write_directory() { # SERVER_ID
-	local id="$1" first=1 name
-	mkdir -p "${RUN_DIR}"
+# Write a storage meta file recording where the writer stored data, so the
+# query side can find it without reconstructing paths by convention.
+# See EXTENDING.md, "Plugin meta files".
+_dsos_write_meta() { # WRITER TARGET SERVER_ID
+	local writer="$1" target="$2" id="$3"
+	local meta_dir="${OUTPUT_DIR}/meta"
+	mkdir -p "$meta_dir"
+	cat >"${meta_dir}/storage-${writer}.json" <<-EOF
 	{
-		printf '{\n  "%s" : {\n' "$id"
-		for name in $(all_targets); do
-			[[ $first -eq 1 ]] || printf ',\n'
-			printf '    "%s" : "%s"' "$name" "$(container_path "$id" "$name")"
-			first=0
-		done
-		printf '\n  }\n}\n'
-	} >"${DIRFILE}"
+	  "target": "${target}",
+	  "backend": "dsos",
+	  "data_root": "${SOS_DATA_ROOT}",
+	  "container_path": "$(container_path "$id" "$target")"
+	}
+	EOF
+}
+
+# Build the dsosd directory file that maps target names to container paths.
+# Uses DS.name and WRITERS to predict the target names each writer will use.
+# The directory file is backend-level metadata (shared across nodes).
+#
+# Multiple servers share the same DIRFILE on the shared filesystem.  Each
+# call adds (or replaces) the entry for one SERVER_ID, preserving entries
+# previously written by other servers.  This avoids the race where a later
+# server's write_directory() overwrites an earlier server's entries, which
+# would leave the earlier server's dsosd unable to find its containers if
+# it re-reads the file.
+write_directory() { # SERVER_ID
+	local id="$1" w name
+	local ds
+	ds="$(ds_name)"
+	mkdir -p "${OUTPUT_DIR}/meta"
+
+	# Collect this server's target→path mappings as a JSON object.
+	local fragment first=1
+	fragment='{'
+	for w in ${WRITERS}; do
+		name="${ds}_${w}"
+		[[ $first -eq 1 ]] || fragment+=','
+		fragment+="\"${name}\":\"$(container_path "$id" "$name")\""
+		first=0
+	done
+	# Include the live target so dsosd can serve live-test queries too.
+	if [[ -n "${LIVE_WRITER:-}" ]]; then
+		name="${ds}_live"
+		[[ $first -eq 1 ]] || fragment+=','
+		fragment+="\"${name}\":\"$(container_path "$id" "$name")\""
+	fi
+	fragment+='}'
+
+	# Merge into the existing directory file (or create a new one).
+	"${PYTHON}" -I -c "
+import json, sys, os
+path, sid, new = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+d = {}
+if os.path.isfile(path):
+    with open(path) as f:
+        d = json.load(f)
+d[sid] = new
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+    f.write('\n')
+" "${DIRFILE}" "$id" "$fragment"
 }
 
 dsosd_registered() {
@@ -129,6 +201,7 @@ plugin_serve_start() { # SERVER_ID
 		deregister || die "could not remove the stale registration"
 	fi
 	write_directory "$id"
+	mkdir -p "${OUTPUT_DIR}/nodes/${HOST}/run" "${OUTPUT_DIR}/logs"
 	log "+ DSOSD_DIRECTORY=$(printf '%q' "${DIRFILE}") DSOSD_SERVER_ID=$(printf '%q' "$id") $(printf '%q ' ${DSOSD})"
 	if [[ -n "${DRY_RUN:-}" ]]; then
 		log "dry run: dsosd not started; registration not checked"
@@ -149,6 +222,7 @@ plugin_serve_start() { # SERVER_ID
 plugin_serve_run() { # SERVER_ID -- foreground, used by the Slurm launcher
 	local id="$1"
 	write_directory "$id"
+	mkdir -p "${OUTPUT_DIR}/nodes/${HOST}/run" "${OUTPUT_DIR}/logs"
 	log "+ DSOSD_DIRECTORY=$(printf '%q' "${DIRFILE}") DSOSD_SERVER_ID=$(printf '%q' "$id") $(printf '%q ' ${DSOSD})"
 	if [[ -n "${DRY_RUN:-}" ]]; then
 		log "dry run: not exec'ing dsosd"
@@ -205,9 +279,11 @@ plugin_clean() { # SERVER_ID
 		run_logged rm -rf "${SOS_DATA_ROOT:?}/${id}"
 		[[ -n "${DRY_RUN:-}" ]] || log "removed ${SOS_DATA_ROOT}/${id}"
 	fi
-	# Remove dsosd run files and session file.
-	run_logged rm -f "${PIDFILE}" "${DIRFILE}" "${LOGFILE}"
-	run_logged rm -f "${RUN_DIR}/dsos-write-session-${HOST}.txt"
-	run_logged rm -f "${RUN_DIR}/sos-schema-${HOST}.json"
+	# Remove dsosd run files (PID under nodes/), daemon log, and
+	# backend-level metadata (directory config, session file, schema).
+	run_logged rm -f "${PIDFILE}" "${LOGFILE}"
+	run_logged rm -f "${DIRFILE}"
+	run_logged rm -f "${OUTPUT_DIR}/meta/dsos-write-session.txt"
+	run_logged rm -f "${OUTPUT_DIR}/meta/sos-schema.json"
 	[[ -n "${DRY_RUN:-}" ]] || log "removed dsosd run files on this node"
 }

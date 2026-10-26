@@ -81,7 +81,7 @@ Settings live in `backends/dsos/dsos_backend.conf` (override from the environmen
 | `DSOSD` | `dsosd` | The `dsosd` command. Set to `sudo -E dsosd` if registering with `rpcbind` needs root |
 | `DSOSQL` | `dsosql` | The `dsosql` command (used by the `dsosql` adapter) |
 | `SOS_ROW_LIMIT` | `4096` | Rows per batch the `dsos` adapter fetches |
-| `SOS_DATA_ROOT` | `${RUN_DIR}/data/${HOSTNAME}` | Where each server's containers are; must match the `sos` backend's value so `dsosd` finds them |
+| `SOS_DATA_ROOT` | `${OUTPUT_DIR}/nodes/${HOSTNAME}/data` | Where each server's containers are; must match the `sos` backend's value so `dsosd` finds them |
 
 ### Choosing the query adapter
 
