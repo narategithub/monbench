@@ -281,6 +281,8 @@ phase_write() {
 		if BE="${WRITE_BACKEND}" on_servers "write-${target}" write "$w" "$target" full; then
 			# Record what was written, where the query node will read it.
 			BE="${WRITE_BACKEND}" remote "${QUERY_HOST}" "meta-${target}" meta "$target" "$w" full || FAILED=1
+			# Print the ingest performance summary.
+			remote "${QUERY_HOST}" "write-summary-${target}" write-summary "$target" || FAILED=1
 		else
 			FAILED=1
 		fi

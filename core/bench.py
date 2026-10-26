@@ -690,8 +690,6 @@ def run_checks(target, query_file, mode="both"):
           f"(adapter '{adapter.name}'), target '{target}' on {', '.join(SERVERS)}")
     print(f"Data set '{DS.name}': {DS.size()} records in {DS.partitions} partitions; {source}")
     ingest = load_ingest_results(target)
-    print("\nIngest performance:")
-    print_ingest_summary(ingest)
     if DRY_RUN:
         print("\nDRY RUN: not connecting to the backend; queries below are resolved but not sent.")
     else:
@@ -715,6 +713,16 @@ def run_checks(target, query_file, mode="both"):
         if not DRY_RUN:
             adapter.close()
     return rep
+
+
+def run_write_summary(target):
+    """Load and print the ingest summary for a target after writing."""
+    source = load_dataset(target, live=False)
+    print(f"Data set '{DS.name}': {DS.size()} records in {DS.partitions} partitions; {source}")
+    ingest = load_ingest_results(target)
+    print("\nIngest performance:")
+    print_ingest_summary(ingest)
+    return ingest
 
 
 def run_live(target):
@@ -776,16 +784,23 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--target", required=True,
                    help="name of the written data (container, database, ...)")
-    p.add_argument("--mode", choices=("check", "query", "both"), default="both",
+    p.add_argument("--mode", choices=("check", "query", "both", "write-summary"),
+                   default="both",
                    help="check = verify only (no timing); "
                         "query = time only (no verification); "
-                        "both = verify then time (default)")
+                        "both = verify then time (default); "
+                        "write-summary = print ingest summary for a target")
     p.add_argument("--live", action="store_true")
     p.add_argument("--queries", default=QUERY_FILE,
                    help="query set file (default: QUERY_FILE, or queries/default.json)")
     a = p.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    if a.mode == "write-summary":
+        run_write_summary(a.target)
+        return 0
+
     suffix = "-live" if a.live else f"-{QUERY_ADAPTER or 'default'}"
     log_path = os.path.join(RESULTS_DIR, f"benchmark-{a.target}{suffix}.log")
     tee = Tee(log_path)

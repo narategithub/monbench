@@ -7,6 +7,7 @@
 #   node.sh write WRITER TARGET full|live INDEX ID write data-set partition INDEX
 #                                                  into TARGET (server node)
 #   node.sh meta TARGET WRITER full|live           record what was written
+#   node.sh write-summary TARGET                   print ingest summary (query node)
 #   node.sh serve-start ID | serve-run ID          start the backend service
 #   node.sh serve-stop | serve-status              stop / check it
 #   node.sh check TARGET [live]                    verify query results (query node)
@@ -138,6 +139,7 @@ case "$action" in
 build) hook build ;;
 write) cmd_write "$@" ;;
 meta) "${PYTHON:-}" "${BENCH_DIR}/core/dataset.py" meta "$@" ;;
+write-summary) cmd_bench write-summary "$@" ;;
 serve-start) hook serve_start "$@" ;;
 serve-run) hook serve_run "$@" ;;
 serve-stop) hook serve_stop ;;
@@ -145,5 +147,5 @@ serve-status) hook serve_status ;;
 check) cmd_bench check "$@" ;;
 query) cmd_bench query "$@" ;;
 clean) hook clean "$@" ;;
-*) sed -n '2,14p' "$0"; exit 2 ;;
+*) sed -n '2,15p' "$0"; exit 2 ;;
 esac
