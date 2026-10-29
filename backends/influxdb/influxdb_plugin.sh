@@ -7,12 +7,12 @@
 #                                             meta file at
 #                                             OUTPUT_DIR/meta/storage-<writer>.json
 #   plugin_serve_start ID                     on the designated server host only;
-#                                             generate a token (offline),
-#                                             start influxdb3, create the
-#                                             database
+#                                             remove data and token of any
+#                                             earlier run, generate a token
+#                                             offline, start influxdb3,
+#                                             create the database
 #   plugin_serve_run   ID                     foreground influxdb3
 #                                             (slurm launcher)
-#                                             sane designated-host-only rule
 #   plugin_serve_stop                         stop influxdb3 (no-op
 #                                             where nothing was started)
 #   plugin_clean       ID                     remove data directory and
@@ -68,8 +68,6 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	[[ "$writer" == "influx" ]] ||
 		die "the influxdb backend has no writer '$writer' (available: influx)"
 
-	# The measurement name comes from the dataset definition's name field
-	# (DS.name), the single source of truth for the logical data name.
 	local measurement
 	measurement="$(ds_name)"
 
@@ -87,7 +85,6 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 	[[ -n "${DRY_RUN:-}" ]] || token="$(_influx_read_token)"
 
 	log "writing ${measurement} to ${INFLUX_DATABASE} (influx writer, ${INFLUX_INTERFACE} interface) on ${INFLUX_HOST}"
-	# Record where we stored data so the query side can find it.
 	_influx_write_meta "$writer" "$measurement"
 	run_logged DATASET="${DATASET}" -- \
 		"${PYTHON}" "${INFLUX_DIR}/writer/influx_write.py" \
@@ -100,8 +97,7 @@ plugin_write() { # WRITER MODE INDEX SERVER_ID
 		--token "$token"
 }
 
-# Write a storage meta file recording what measurement the writer used, so
-# the query side can find it without reconstructing the name by convention.
+# Write the storage meta file read by the query side.
 # See EXTENDING.md, "Plugin meta files".
 _influx_write_meta() { # WRITER MEASUREMENT
 	local writer="$1" measurement="$2"
@@ -128,6 +124,25 @@ _influx_read_token() {
 		"${INFLUX_TOKEN_FILE}"
 }
 
+# Remove the data and token of any earlier run and generate an admin token
+# offline. The server must not be running. The CLI prints the token to stdout
+# even with --output-file; the redirect sends that to the influxdb3 log.
+_influx_fresh_start() {
+	if [[ -n "$(ls -A "${INFLUX_DATA_DIR}" 2>/dev/null)" ]]; then
+		log "removing data from an earlier run: ${INFLUX_DATA_DIR}"
+		rm -rf "${INFLUX_DATA_DIR:?}"
+		mkdir -p "${INFLUX_DATA_DIR}"
+	fi
+	rm -f "${INFLUX_TOKEN_FILE}"
+	log "generating admin token"
+	influxdb3 create token --admin \
+		--offline \
+		--name "monbench-admin" \
+		--output-file "${INFLUX_TOKEN_FILE}" \
+		>>"${_INFLUX_LOG}" 2>&1 \
+		|| die "token generation failed; see ${_INFLUX_LOG}"
+}
+
 # ----------------------------------------------------------------- serve
 
 plugin_serve_start() { # SERVER_ID
@@ -144,24 +159,10 @@ plugin_serve_start() { # SERVER_ID
 		return 0
 	fi
 
-        # Kill any leftover process from a previous run before starting a new one.
-        pkill -f 'influxdb3 serve' 2>/dev/null || true
-        sleep 1
+	pkill -f 'influxdb3 serve' 2>/dev/null || true
+	sleep 1
 
-	# Generate an admin token offline so we have it before the server starts.
-	# --offline writes a JSON file; the server is then started with that file
-	# so auth is active from the first request. The CLI also prints the
-	# token to its own stdout (even with --output-file given); redirect that
-	# to the influxdb3 log instead of letting it reach the terminal, and
-	# fall back to the token file if a reader needs it for debugging.
-	log "generating admin token"
-	influxdb3 create token --admin \
-		--offline \
-		--name "monbench-admin" \
-		--output-file "${INFLUX_TOKEN_FILE}" \
-		>>"${_INFLUX_LOG}" 2>&1 \
-		|| die "token generation failed; see ${_INFLUX_LOG}" \
-		>/dev/null
+	_influx_fresh_start
 
 	log "starting influxdb3 (data: ${INFLUX_DATA_DIR})"
 	influxdb3 serve \
@@ -178,13 +179,14 @@ plugin_serve_start() { # SERVER_ID
 		|| die "influxdb3 exited immediately; see ${_INFLUX_LOG}"
 	log "influxdb3 started"
 
-	# Create the database using the generated token.
-	local token
+	local token out
 	token="$(_influx_read_token)"
-	influxdb3 create database "${INFLUX_DATABASE}" \
-		--host "${INFLUX_HOST}" \
-		--token "$token" 2>/dev/null || true
-	log "database '${INFLUX_DATABASE}' ready"
+	if out="$(influxdb3 create database "${INFLUX_DATABASE}" \
+		--host "${INFLUX_HOST}" --token "$token" 2>&1)"; then
+		log "database '${INFLUX_DATABASE}' ready"
+	else
+		log "WARNING: could not create database '${INFLUX_DATABASE}': ${out}"
+	fi
 }
 
 plugin_serve_run() { # SERVER_ID  (foreground; used by the slurm launcher)
