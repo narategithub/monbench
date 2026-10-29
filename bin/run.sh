@@ -24,9 +24,31 @@
 #   all          build serve-write write serve-query check query stop
 #   all-nocheck  build serve-write write serve-query query stop
 #
+# Failed steps and what runs after them:
+#   check and query are NOT run for a writer whose write step failed (the data
+#   they would read is missing or incomplete), and not at all when the service
+#   they need (serve-write / serve-query) failed to start. Each skipped step is
+#   reported, and the pair counts as FAILED. This only applies to steps that
+#   ran earlier in the same invocation: "run.sh check" on its own always runs.
+#   Other phases (stop, clean, ...) always run, so services are not left up.
+#
+# Configuration errors end the whole suite:
+#   Before anything runs (including deploy), every pair in BACKENDS is set up
+#   once and validated: unknown backend, a query backend that cannot read what
+#   the write backend writes, no writers, missing SERVER_HOSTS/QUERY_HOST. Any
+#   error stops run.sh with nothing started.
+#
 # Launchers:
-#   ssh      run each step over ssh (default)
-#   slurm    run each step with srun inside an allocation (see slurm/)
+#   ssh      run each step over ssh (default). The command is run as
+#            "bash -l -c '<cmd>'", i.e. in a login shell, so the profile files
+#            of the server host (/etc/profile, ~/.bash_profile or ~/.profile)
+#            set up PATH/PYTHONPATH/LD_LIBRARY_PATH as they would for a login.
+#            Set LOGIN_SHELL=0 in bench.conf to run the bare command instead.
+#            (A login shell is not the same as an interactive one: ~/.bashrc
+#            is only read if a profile file sources it, and many ~/.bashrc
+#            files return early when the shell is not interactive.)
+#   slurm    run each step with srun inside an allocation (see slurm/); the
+#            steps inherit the environment of the submitting shell
 #   manual   print each step for you to run on the named node, then wait
 #
 # Dry run:
@@ -45,9 +67,12 @@
 # VAR=val ... bash bin/node.sh ACTION ARGS..." line a step runs, to that
 # step's log file under OUTPUT_DIR/logs (see remote() below) -- self-
 # contained, so it can be copied onto the named host and run as-is, with
-# or without -d. With -d (or -l manual), that line also prints to stdout,
-# since it IS the result there; on a real ssh/slurm run it only goes to
-# the log file, so stdout stays readable -- check the log file for it.
+# or without -d. (Under the ssh launcher the line actually sent is that
+# line wrapped in "bash -l -c"; the logged line is the inner command, to
+# paste into a shell that already has your login environment.) With -d (or
+# -l manual), that line also prints to stdout, since it IS the result
+# there; on a real ssh/slurm run it only goes to the log file, so stdout
+# stays readable -- check the log file for it.
 # bin/node.sh's run_logged() goes further for the actual external command a
 # hook runs (the writer invocation, a build, a clean): see its doc comment
 # in bin/node.sh for how a command that reads a setting from its own
@@ -65,8 +90,13 @@
 #   in the order listed, before moving to the next pair (deploy excepted --
 #   it runs once, since it does not depend on the backend).
 #
+#   Each pair runs in its own subshell: the settings a backend's
+#   <name>_backend.conf defines (WRITERS from DEFAULT_WRITERS, LIVE_WRITER,
+#   data roots, ...) belong to that pair and never leak into the next one.
+#   A pair that fails does not stop the following pairs.
+#
 #   OUTPUT_DIR is namespaced per pair, named after it (e.g. "sos-dsos",
-#   "influxdb"). That name is fixed once per pair (see run_pair below) and
+#   "influxdb"). That name is fixed once per pair (see setup_pair below) and
 #   reused by every phase in it.
 #
 #   OUTPUT_DIR/<pair>/ layout (see EXTENDING.md for the full spec):
@@ -85,16 +115,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="$(cd "${HERE}/.." && pwd)/bench.conf"
 LAUNCHER="ssh"
 
+# The header comment above is the usage text: print it up to "set -euo".
+usage() { sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; }
+
 while getopts "c:l:dh" opt; do
 	case "$opt" in
 	c) CONF="$(cd "$(dirname "$OPTARG")" && pwd)/$(basename "$OPTARG")" ;;
 	l) LAUNCHER="$OPTARG" ;;
 	d) DRY_RUN=1 ;;
-	*) sed -n '2,79p' "$0"; exit 2 ;;
+	*) usage; exit 2 ;;
 	esac
 done
 shift $((OPTIND - 1))
-[[ $# -gt 0 ]] || { sed -n '2,79p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { usage; exit 2; }
 case "$LAUNCHER" in ssh | slurm | manual) ;; *) echo "unknown launcher '$LAUNCHER'" >&2; exit 2 ;; esac
 
 # In the Slurm launcher, empty host settings are filled from the allocation.
@@ -110,6 +143,9 @@ fi
 
 # shellcheck source=../bench.conf
 source "$CONF"
+
+# Run ssh steps in a login shell (see "Launchers" above). 1 = yes (default).
+LOGIN_SHELL="${LOGIN_SHELL:-1}"
 
 # ------------------------------------------------------------ backend pairs
 # BACKENDS, if set, lists every write/query pair to run this invocation, as
@@ -133,7 +169,7 @@ for _chk in "${PAIRS[@]}"; do
 		{ echo "no backend configured: set BACKENDS, or WRITE_BACKEND/QUERY_BACKEND, in bench.conf (see bench.conf.example)" >&2; exit 1; }
 done
 
-# OUTPUT_DIR is namespaced per pair below (see run_pair).
+# OUTPUT_DIR is namespaced per pair below (see setup_pair).
 BASE_OUTPUT_DIR="${OUTPUT_DIR}"
 
 [[ -n "${SERVER_HOSTS:-}" ]] || { echo "SERVER_HOSTS must be set in bench.conf (see bench.conf.example)" >&2; exit 1; }
@@ -167,6 +203,20 @@ node_cmd() { # ACTION ARGS... -> command line to run on a node
 	printf ' %q' "$@"
 }
 
+# What is handed to ssh for a node_cmd() line: wrapped in a login shell, so
+# the server host's profile (PATH, PYTHONPATH, ...) is loaded first. The
+# "env VAR=val ..." assignments inside the command are applied after the
+# profile ran, so settings forwarded from bench.conf still win over it.
+# The command is quoted for the remote side, whatever the remote login
+# shell is.
+ssh_wrap() { # CMD
+	if [[ "${LOGIN_SHELL}" == "1" ]]; then
+		printf 'bash -l -c %q' "$1"
+	else
+		printf '%s' "$1"
+	fi
+}
+
 wait_for_user() {
 	# Without a terminal (e.g. output redirected in a batch job) do not wait.
 	{ read -r -p "   Press Enter when the step above has finished... " _ </dev/tty; } 2>/dev/null || true
@@ -194,7 +244,7 @@ remote() { # HOST LOGNAME ACTION ARGS...
 		else
 			printf '   on %s:\n     %s\n' "$host" "$cmd" >"${LOG_DIR}/${logname}.log"
 		fi
-		ssh -n ${SSH_OPTS} "$host" "$cmd" 2>&1 | tee -a "${LOG_DIR}/${logname}.log"
+		ssh -n ${SSH_OPTS} "$host" "$(ssh_wrap "$cmd")" 2>&1 | tee -a "${LOG_DIR}/${logname}.log"
 		return "${PIPESTATUS[0]}"
 		;;
 	slurm)
@@ -237,9 +287,38 @@ on_servers() { # LOGPREFIX ACTION ARGS...
 	return $rc
 }
 
+# ------------------------------------------------- failure bookkeeping
+# Per pair (set up in run_pair). BLOCKED names the first service phase
+# (serve-write / serve-query) that failed; WRITE_FAILED has an entry for each
+# writer whose write step failed; SKIPPED lists the check/query steps that
+# were not run because of either.
+block() { # PHASE
+	FAILED=1
+	[[ -n "$BLOCKED" ]] || BLOCKED="$1"
+}
+
+# Prints why WRITER's check/query must not run, and returns 0; returns 1 when
+# nothing upstream failed.
+skip_reason() { # WRITER
+	if [[ -n "$BLOCKED" ]]; then
+		echo "the ${BLOCKED} phase failed"
+		return 0
+	fi
+	if [[ -n "${WRITE_FAILED[$1]:-}" ]]; then
+		echo "the write phase failed for writer '$1'"
+		return 0
+	fi
+	return 1
+}
+
+skip_step() { # STEP WRITER REASON
+	echo "   not run: $3"
+	SKIPPED+="${SKIPPED:+, }$1 $2"
+}
+
 # ----------------------------------------------------------------- phases
 # Backend-independent except for reading the current WRITE_BACKEND/
-# QUERY_BACKEND/PAIR_NAME globals, which run_pair sets before calling these.
+# QUERY_BACKEND/PAIR_NAME globals, which setup_pair sets before these run.
 
 phase_deploy() {
 	[[ "$LAUNCHER" == "ssh" ]] || { echo "   deploy is only needed with the ssh launcher"; return 0; }
@@ -259,35 +338,46 @@ phase_deploy() {
 		echo "   ${host}: copying ${BENCH_DIR}"
 		ssh -n ${SSH_OPTS} "$host" mkdir -p "$(printf '%q' "$BENCH_DIR")"
 		if command -v rsync >/dev/null; then
-			rsync -a --exclude results -e "ssh ${SSH_OPTS}" "${BENCH_DIR}/" "${host}:${BENCH_DIR}/"
+			rsync -a --exclude results --exclude .monbench-id -e "ssh ${SSH_OPTS}" "${BENCH_DIR}/" "${host}:${BENCH_DIR}/"
 		else
 			scp -rq ${SSH_OPTS} "${BENCH_DIR}/." "${host}:${BENCH_DIR}/"
+			# scp has no --exclude; remove the marker after copying so the
+			# shared-filesystem check keeps working on the next deploy.
+			ssh -n ${SSH_OPTS} "$host" rm -f "$(printf '%q' "$marker")"
 		fi
 	done
 }
 
 phase_build() {
 	local host
-	# Sequential, so that builds in a shared directory do not collide.
+	# Sequential, so that builds in a shared directory do not collide. A
+	# failed build is not a blocker by itself: the writer that needed it
+	# fails in the write phase, and only that writer's check/query is skipped.
 	for host in "${SERVERS[@]}"; do
 		BE="${WRITE_BACKEND}" remote "$host" "build-${host}" build || FAILED=1
 	done
 }
 
 phase_write() {
-	local w
+	local w ok
 	for w in ${WRITERS}; do
 		say "write: ${w} writer (${WRITE_BACKEND}) on ${SERVERS[*]}"
+		ok=1
 		if BE="${WRITE_BACKEND}" on_servers "write-${w}" write "$w" full; then
 			# Record what was written; the plugin wrote storage details to
 			# OUTPUT_DIR/meta/storage-<writer>.json on each server, and this
 			# meta step on the query node writes the dataset/params metadata
-			# that the query engine reads.
-			BE="${WRITE_BACKEND}" remote "${QUERY_HOST}" "meta-${w}" meta "$w" full || FAILED=1
+			# that the query engine reads. Without it the query side cannot
+			# find the data, so a failed meta step counts as a failed write.
+			BE="${WRITE_BACKEND}" remote "${QUERY_HOST}" "meta-${w}" meta "$w" full || ok=0
 			# Print the ingest performance summary.
 			remote "${QUERY_HOST}" "write-summary-${w}" write-summary "$w" || FAILED=1
 		else
+			ok=0
+		fi
+		if [[ $ok -eq 0 ]]; then
 			FAILED=1
+			WRITE_FAILED[$w]=1
 		fi
 	done
 }
@@ -304,7 +394,7 @@ _phase_serve_backend() { # BACKEND_NAME SERVICE_FLAG LOG_PREFIX
 	case "$LAUNCHER" in
 	ssh | manual)
 		for host in "${SERVERS[@]}"; do
-			BE="${backend}" remote "$host" "${prefix}-${host}" serve-start "$host" || FAILED=1
+			BE="${backend}" remote "$host" "${prefix}-${host}" serve-start "$host" || block "$prefix"
 		done
 		;;
 	slurm)
@@ -327,7 +417,7 @@ _phase_serve_backend() { # BACKEND_NAME SERVICE_FLAG LOG_PREFIX
 				BE="${backend}" remote "$host" "${prefix}-status-${host}" serve-status >/dev/null 2>&1 && break
 				sleep 2
 			done
-			BE="${backend}" remote "$host" "${prefix}-status-${host}" serve-status || FAILED=1
+			BE="${backend}" remote "$host" "${prefix}-status-${host}" serve-status || block "$prefix"
 		done
 		;;
 	esac
@@ -365,17 +455,25 @@ phase_query_serve() {
 }
 
 phase_check() {
-	local w
+	local w reason
 	for w in ${WRITERS}; do
 		say "check: ${w} writer from ${QUERY_HOST}"
+		if reason="$(skip_reason "$w")"; then
+			skip_step check "$w" "$reason"
+			continue
+		fi
 		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "check-${w}" check "$w" || FAILED=1
 	done
 }
 
 phase_query() {
-	local w
+	local w reason
 	for w in ${WRITERS}; do
 		say "query: ${w} writer from ${QUERY_HOST}"
+		if reason="$(skip_reason "$w")"; then
+			skip_step query "$w" "$reason"
+			continue
+		fi
 		BE="${QUERY_BACKEND}" remote "${QUERY_HOST}" "query-${w}" query "$w" || FAILED=1
 	done
 }
@@ -417,40 +515,20 @@ phase_clean() {
 	done
 }
 
-# ------------------------------------------------------------- phase list
-# Expanded once; shared by every pair. 'deploy' is pulled out and run once,
-# up front, since it copies the whole directory and does not depend on which
-# backend pair is running.
-PHASES=()
-for phase in "$@"; do
-	case "$phase" in
-	all)         PHASES+=(build serve-write write serve-query check query stop) ;;
-	all-nocheck) PHASES+=(build serve-write write serve-query query stop) ;;
-	*)           PHASES+=("$phase") ;;
-	esac
-done
-
-RUN_PHASES=()
-DID_DEPLOY=0
-for phase in "${PHASES[@]}"; do
-	if [[ "$phase" == "deploy" ]]; then
-		if [[ $DID_DEPLOY -eq 0 ]]; then
-			say "phase: deploy"
-			phase_deploy
-			DID_DEPLOY=1
-		fi
-	else
-		RUN_PHASES+=("$phase")
-	fi
-done
-
-# ------------------------------------------------------- per-pair driver
-run_pair() { # WRITE_BACKEND QUERY_BACKEND
+# ------------------------------------------------------- pair set-up
+# Resolve and validate everything about one pair, setting the per-pair
+# globals (PAIR_NAME, OUTPUT_DIR, LOG_DIR, WRITERS, W_SERVICE, Q_SERVICE,
+# CONFIG_VARS, ...). Touches nothing on disk, and exits non-zero on any
+# configuration error, so it can run for every pair up front (see
+# "pre-flight" below) as well as at the start of each pair's run. Always call
+# it in a subshell: it sources backend confs, which would otherwise leak into
+# the next pair.
+setup_pair() { # WRITE_BACKEND QUERY_BACKEND
 	WRITE_BACKEND="$1" QUERY_BACKEND="$2"
 	PAIR_NAME="${WRITE_BACKEND}"
 	[[ "${WRITE_BACKEND}" != "${QUERY_BACKEND}" ]] && PAIR_NAME="${WRITE_BACKEND}-${QUERY_BACKEND}"
 	# OUTPUT_DIR: namespaced per pair, fixed once here for the whole pair's
-	# run and reused by every phase below (build, write, check, query, ...)
+	# run and reused by every phase (build, write, check, query, ...)
 	# regardless of which single backend -- write or query -- is actually
 	# doing the work for a given phase. That is what keeps a pair's write
 	# and query sides agreeing on where the data is: both read the one
@@ -458,17 +536,6 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	# whichever single backend happens to be running that particular phase.
 	OUTPUT_DIR="${BASE_OUTPUT_DIR}/${PAIR_NAME}"
 	LOG_DIR="${OUTPUT_DIR}/logs"
-	mkdir -p "$LOG_DIR"
-	# Create the well-defined OUTPUT_DIR subdirectory layout (see
-	# EXTENDING.md for the full spec):
-	#   meta/     backend-level metadata (shared across nodes; write→query
-	#             handoff and dataset params)
-	#   results/  benchmark statistics (user-facing output)
-	#   logs/     all logs (step, daemon, benchmark)
-	# nodes/<hostname>/ subdirectories (data/, run/, tmp/) are created by
-	# each plugin on its own server host.
-	mkdir -p "${OUTPUT_DIR}/meta" "${OUTPUT_DIR}/results" "${OUTPUT_DIR}/logs"
-	FAILED=0
 
 	check_plugin "${WRITE_BACKEND}"
 	check_plugin "${QUERY_BACKEND}"
@@ -515,12 +582,77 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 		INTERVAL JOB_LEN BATCH QUERY_ADAPTER QUERY_FILE REPEAT LIMIT_N
 		LIVE_WRITER LIVE_RATE LIVE_BATCH LIVE_SAMPLES LIVE_POLL DRY_RUN)
 	# Forward each plugin's own settings too, from both backends.
+	local _bc _pv _v
 	for _bc in "${WRITE_BACKEND}" "${QUERY_BACKEND}"; do
 		_pv="$(PLUGIN_VARS=""; source "${BENCH_DIR}/backends/${_bc}/${_bc}_backend.conf" 2>/dev/null; echo "${PLUGIN_VARS:-}")"
 		for _v in ${_pv}; do
 			[[ " ${CONFIG_VARS[*]} " == *" ${_v} "* ]] || CONFIG_VARS+=("${_v}")
 		done
 	done
+}
+
+# ------------------------------------------------------------- phase list
+# Expanded once; shared by every pair. 'deploy' is pulled out and run once,
+# up front, since it copies the whole directory and does not depend on which
+# backend pair is running.
+PHASES=()
+for phase in "$@"; do
+	case "$phase" in
+	all)         PHASES+=(build serve-write write serve-query check query stop) ;;
+	all-nocheck) PHASES+=(build serve-write write serve-query query stop) ;;
+	*)           PHASES+=("$phase") ;;
+	esac
+done
+
+# ------------------------------------------------------------- pre-flight
+# A configuration error (unknown backend, unreadable data, no writers, ...)
+# means the suite cannot run as asked, so find every one before anything is
+# deployed, built or started, and end the whole run.
+for _pair in "${PAIRS[@]}"; do
+	set +e
+	( set -e; setup_pair "${_pair%%:*}" "${_pair#*:}" )
+	_rc=$?
+	set -e
+	if [[ $_rc -ne 0 ]]; then
+		echo "monbench: configuration error in backend pair '${_pair}'; nothing was run" >&2
+		exit 1
+	fi
+done
+
+RUN_PHASES=()
+DID_DEPLOY=0
+for phase in "${PHASES[@]}"; do
+	if [[ "$phase" == "deploy" ]]; then
+		if [[ $DID_DEPLOY -eq 0 ]]; then
+			say "phase: deploy"
+			phase_deploy
+			DID_DEPLOY=1
+		fi
+	else
+		RUN_PHASES+=("$phase")
+	fi
+done
+
+# ------------------------------------------------------- per-pair driver
+# Runs in a subshell (see the loop at the bottom), so everything it sets is
+# private to the pair; its exit status is 0 when every step succeeded.
+run_pair() { # WRITE_BACKEND QUERY_BACKEND
+	setup_pair "$1" "$2"
+
+	# Create the well-defined OUTPUT_DIR subdirectory layout (see
+	# EXTENDING.md for the full spec):
+	#   meta/     backend-level metadata (shared across nodes; write→query
+	#             handoff and dataset params)
+	#   results/  benchmark statistics (user-facing output)
+	#   logs/     all logs (step, daemon, benchmark)
+	# nodes/<hostname>/ subdirectories (data/, run/, tmp/) are created by
+	# each plugin on its own server host.
+	mkdir -p "${OUTPUT_DIR}/meta" "${OUTPUT_DIR}/results" "${LOG_DIR}"
+
+	FAILED=0
+	BLOCKED=""
+	SKIPPED=""
+	declare -A WRITE_FAILED=()
 
 	echo "monbench: pair=${PAIR_NAME} write=${WRITE_BACKEND} query=${QUERY_BACKEND} launcher=${LAUNCHER} servers=${SERVERS[*]} query-host=${QUERY_HOST}"
 	echo "          ${COMPONENT_IDS_PER_SERVER} component IDs x ${SAMPLES} samples per server, writers: ${WRITERS}"
@@ -529,7 +661,7 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	for phase in "${RUN_PHASES[@]}"; do
 		say "phase: ${phase} (${PAIR_NAME})"
 		case "$phase" in
-		build) phase_build || FAILED=1 ;;
+		build) phase_build ;;
 		serve-write) phase_write_serve ;;
 		write) phase_write ;;
 		serve-query) phase_query_serve ;;
@@ -543,11 +675,19 @@ run_pair() { # WRITE_BACKEND QUERY_BACKEND
 	done
 
 	say "pair ${PAIR_NAME} done: $([[ $FAILED -eq 0 ]] && echo 'all steps succeeded' || echo 'one or more steps FAILED')"
-	[[ $FAILED -eq 0 ]] || OVERALL_FAILED=1
+	[[ -z "$SKIPPED" ]] || echo "   not run because an earlier step failed: ${SKIPPED}"
+	exit "$FAILED"
 }
 
 for _pair in "${PAIRS[@]}"; do
-	run_pair "${_pair%%:*}" "${_pair#*:}"
+	# A subshell per pair: settings from one pair's backend confs must not
+	# leak into the next. errexit is switched off around the call so a
+	# failing pair is recorded, not fatal, and back on inside it.
+	set +e
+	( set -e; run_pair "${_pair%%:*}" "${_pair#*:}" )
+	_rc=$?
+	set -e
+	[[ $_rc -eq 0 ]] || OVERALL_FAILED=1
 done
 
 say "done: $([[ $OVERALL_FAILED -eq 0 ]] && echo 'all pairs succeeded' || echo 'one or more pairs FAILED')"
